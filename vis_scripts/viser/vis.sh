@@ -8,5 +8,5 @@ METHOD="${name##*_}"           # -> ours
 
 
 
-
+# python vis_c_dual.py 0917_pkr_5_ours 0917_pkr_5_ours
 python visualize_viser_robot_z.py --scene $SCENE --types $METHOD --parent_name $DATE --method $METHOD

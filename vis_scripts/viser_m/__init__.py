@@ -1,1 +1,0 @@
-"""Viser M visualization utilities."""

@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-name="${1:?Give base name like 0831_19_indoor_walk_off_mvs_ours or 0831_19_indoor_walk_off_mvs_ours_trimesh}"
+if [ $# -lt 1 ]; then
+  echo "Usage: $0 <name> [options]"
+  echo "Example: $0 0831_19_indoor_walk_off_mvs_ours"
+  echo "         $0 0831_19_indoor_walk_off_mvs_ours_trimesh"
+  exit 1
+fi
+
+name="$1"
+shift
 
 # 0831
 DATE="${name%%_*}"
@@ -30,6 +38,9 @@ echo "DATE=$DATE"
 echo "SCENE=$SCENE"
 echo "METHOD=$METHOD"
 
-
-
-python visualize_viser_robot_z_quick.py --scene $SCENE --types $METHOD --parent_name $DATE --method $METHOD
+python visualize_viser_robot_z_quick.py \
+  --scene "$SCENE" \
+  --types "$METHOD" \
+  --parent_name "$DATE" \
+  --method "$METHOD" \
+  "$@"

@@ -1,12 +1,3 @@
-set -euo pipefail
-
-################################################################################
-# 1) Make sure conda’s shell functions are available in this script:
-#    Option A: using the "conda shell.bash hook":
-eval "$(conda shell.bash hook)"
-
-conda activate crisp
-
 #!/bin/bash
 
 cd ../prep/HMR
@@ -22,7 +13,7 @@ GPU_IDS=($(seq 0 $((GPU_COUNT - 1))))
 # Find all *.mp4 files in the directory
 VIDEO_FILES=($(find "$VIDEO_DIR" -maxdepth 1 -name "*.mp4"))
 TOTAL_FILES=${#VIDEO_FILES[@]}
-
+echo $pwd
 # Function to process a video on a specific GPU
 process_video() {
     local video_file="$1"
@@ -30,6 +21,7 @@ process_video() {
     echo "Processing $video_file on GPU $gpu_id"
     CUDA_VISIBLE_DEVICES=$gpu_id sh demo.sh "$video_file"
 }
+
 
 # Track how many tasks are on each GPU
 declare -A GPU_TASKS

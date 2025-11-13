@@ -49,6 +49,30 @@ class ViserHelper:
         self._server = viser.ViserServer(port=self.port)
         ViserHelper._global_servers[self.port] = self
         self._ok = True
+        self._add_ground_plane()
+
+    def _add_ground_plane(self):
+        """Add a checkerboard grid so z=0 is visually grounded."""
+        if not self._ok or self._server is None:
+            return
+        scene = getattr(self._server, "scene", None)
+        if scene is None or not hasattr(scene, "add_grid"):
+            return
+        try:
+            scene.add_grid(
+                "/ground",
+                width=30.0,
+                height=30.0,
+                position=(0.0, 0.0, 0.0),
+                plane="xy",
+            )
+        except TypeError:
+            scene.add_grid(
+                "/ground",
+                width=30.0,
+                height=30.0,
+                position=(0.0, 0.0, 0.0),
+            )
 
     def add_mesh_simple(
         self,
@@ -383,4 +407,3 @@ def demo_call(
         out_dir=out_dir,
         fps=30,
     )
-

@@ -1,6 +1,0 @@
-# C++ formatting rules; used for WebAssembly code.
-BasedOnStyle: LLVM
-AlignAfterOpenBracket: BlockIndent
-BinPackArguments: false
-BinPackParameters: false
-IndentWidth: 4

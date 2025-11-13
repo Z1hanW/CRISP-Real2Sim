@@ -1,9 +1,3 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# 1) Make sure conda’s shell functions are available:
-eval "$(conda shell.bash hook)"
-conda activate crisp
 cd ../prep/AutoMask
 #!/bin/bash
 
@@ -18,6 +12,7 @@ cd ../prep/AutoMask
 #   5) Run the Python script in parallel on each GPU.
 
 DATA_PATH="${1}_img"
+
 
 # Count how many GPUs you have
 GPU_COUNT=$(nvidia-smi -L | wc -l)
@@ -37,6 +32,8 @@ for i in "${!folders[@]}"; do
     GPU_ID=$(( i % GPU_COUNT ))
     
     echo "Launching job for '$folder' on GPU $GPU_ID ..."
+
+    SAVE_PATH="../../results/init/dyn_mask"
     
     # Run the Python script in the background
     CUDA_VISIBLE_DEVICES=$GPU_ID \

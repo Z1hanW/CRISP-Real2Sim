@@ -1,6 +1,6 @@
 #!/bin/bash
 
-cd /data3/zihanwa3/_Robotics/_vision/tram
+cd ../prep/AutoMask/preprocess #/data3/zihanwa3/_Robotics/_vision/tram
 
 VIDEO_DIR="${1}_videos"
 IMG_DIR="${1}_img"

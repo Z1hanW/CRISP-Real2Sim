@@ -77,6 +77,30 @@ class EnhancedViserHelper:
         EnhancedViserHelper._global_servers[self.port] = self
         self._ok = True
         print(f"[Viser] Server started at http://localhost:{self.port}")
+        self._add_ground_plane()
+
+    def _add_ground_plane(self):
+        """Ensure a checkerboard ground is visible at z=0."""
+        if not self._ok or self._server is None:
+            return
+        scene = getattr(self._server, "scene", None)
+        if scene is None or not hasattr(scene, "add_grid"):
+            return
+        try:
+            scene.add_grid(
+                "/ground",
+                width=30.0,
+                height=30.0,
+                position=(0.0, 0.0, 0.0),
+                plane="xy",
+            )
+        except TypeError:
+            scene.add_grid(
+                "/ground",
+                width=30.0,
+                height=30.0,
+                position=(0.0, 0.0, 0.0),
+            )
 
     def _setup_ui(self):
         """设置UI控制面板"""

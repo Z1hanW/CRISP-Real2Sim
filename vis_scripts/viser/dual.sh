@@ -24,4 +24,4 @@ echo "Robot 2: $name_2"
 echo "==========================================="
 
 # Run the Python script with both names
-python scripts/visualize_viser_robot_z_dual.py "$name_1" "$name_2" "$@"
+python vis_c_dual.py "$name_1" "$name_2" "$@"

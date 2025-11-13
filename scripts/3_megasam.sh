@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-set -eo pipefail 
-eval "$(conda shell.bash hook)"
-conda activate crisp
+#set -eo pipefail 
+#eval "$(conda shell.bash hook)"
+# conda activate crisp
 
 cd ../prep/MogeSAM
 
