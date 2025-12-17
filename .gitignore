@@ -100,3 +100,5 @@ datasets/
 
 # local node env
 .nodeenv/
+
+rendered_output
