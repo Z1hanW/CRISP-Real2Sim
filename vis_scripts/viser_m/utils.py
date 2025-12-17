@@ -3,15 +3,17 @@ import matplotlib.cm as cm
 import numpy as np
 from pathlib import Path
 import torch
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 import torch
 import torch.nn.functional as F
 import numpy as np
 from sklearn.cluster import DBSCAN
+from sklearn.cluster import MiniBatchKMeans
 from typing import Dict, List, Tuple, Optional, Set
 from pathlib import Path
 from collections import defaultdict
 import re
+import json
 
 import open3d as o3d
 import numpy as np
@@ -94,6 +96,70 @@ def get_icosphere(level=3, order_verts_by=None, colored=False, flip_faces=False)
         colors = (verts - verts.min(0)[0]) / (verts.max(0)[0] - verts.min(0)[0])
         mesh.textures = TexturesVertex(verts_features=colors[None])
     return mesh
+
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import numpy as np
+from pathlib import Path
+import torch
+from typing import Dict, List, Tuple
+import torch
+import torch.nn.functional as F
+import numpy as np
+from sklearn.cluster import DBSCAN
+from typing import Dict, List, Tuple, Optional, Set
+from pathlib import Path
+from collections import defaultdict
+import re
+from typing import Dict, List, Optional, Any
+import open3d as o3d
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as colors
+from matplotlib.colors import hsv_to_rgb
+import cv2
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+import argparse
+
+from PIL import Image
+import torch
+import open3d as o3d
+import open3d.core as o3c
+import numpy as np
+from math import ceil
+from sklearn.cluster import DBSCAN
+from math import ceil
+import matplotlib.cm as cm
+from matplotlib.colors import ListedColormap
+import colorsys
+from sklearn.cluster import KMeans
+from pathlib import Path
+import copy
+from math import ceil
+import colorsys
+import numpy as np
+import torch
+from sklearn.cluster import KMeans
+from sklearn.cluster import DBSCAN
+from sklearn.cluster import MeanShift, estimate_bandwidth
+import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
+
+from typing import Tuple
+import numpy as np
+from scipy.spatial import cKDTree
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+import cv2
+from copy import copy
+from typing import Dict, List
+
+_PRIM_KEYS = ["S_items", "R_items", "T_items", "pts_items"]
 
 def _as_list(v):
     if v is None:
@@ -1680,6 +1746,52 @@ def merge_segments_across_frames(
     return final_segments
 
 
+def ransac_plane_torch(
+    pts_cam: torch.Tensor,
+    n_iters: int = 200,
+    inlier_thresh: float = 0.01,
+    device: str = "cpu"
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    RANSAC plane fitting on points.
+    
+    Returns:
+        n: Normal vector of the plane
+        p0: Point on the plane
+        mask: Inlier mask
+    """
+    N = pts_cam.shape[0]
+    best_inliers = 0
+    best_n = None
+    best_p0 = None
+    best_mask = None
+
+    for _ in range(n_iters):
+        idx = torch.randperm(N, device=device)[:3]
+        p0, p1, p2 = pts_cam[idx]
+
+        v1, v2 = p1 - p0, p2 - p0
+        n = torch.cross(v1, v2)
+        if torch.linalg.norm(n) < 1e-6:
+            continue
+        n = F.normalize(n, dim=0)
+        
+        # Ensure normal points in consistent direction
+        if n[2] > 0:
+            n = -n
+
+        dists = torch.abs((pts_cam - p0) @ n)
+        inliers = dists < inlier_thresh
+        n_inl = int(inliers.sum())
+
+        if n_inl > best_inliers:
+            best_inliers = n_inl
+            best_n = n
+            best_p0 = pts_cam[inliers].mean(0)
+            best_mask = inliers
+
+    return best_n, best_p0, best_mask
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -2056,6 +2168,120 @@ def farthest_point_sampling(points, n_samples):
     return indices
 
 
+def find_minimal_volume_bbox(points: torch.Tensor, device: str = 'cuda') -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Find the minimal volume oriented bounding box using PCA and rotation search.
+    
+    Args:
+        points: (N, 3) point cloud
+        device: computation device
+        
+    Returns:
+        R_bw: (3, 3) rotation matrix (body to world)
+        center: (3,) center of bbox
+        half_sizes: (3,) half dimensions of bbox
+    """
+    points = points.to(device)
+    
+    # Center points
+    center = points.mean(0)
+    points_centered = points - center
+    
+    # Initial orientation from PCA
+    _, _, Vt = torch.linalg.svd(points_centered, full_matrices=False)
+    
+    # Try multiple orientations to find minimal volume
+    best_volume = float('inf')
+    best_R = None
+    best_half_sizes = None
+    best_center = center.clone()
+    
+    # Method 1: PCA-based initial guess
+    R_pca = Vt.T  # Principal axes as columns
+    
+    # Ensure right-handed coordinate system
+    if torch.det(R_pca) < 0:
+        R_pca[:, 2] = -R_pca[:, 2]
+    
+    # Project points to PCA frame
+    points_pca = points_centered @ R_pca
+    
+    # Compute bbox in PCA frame
+    min_vals = points_pca.min(dim=0).values
+    max_vals = points_pca.max(dim=0).values
+    half_sizes_pca = (max_vals - min_vals) / 2
+    center_offset_pca = (max_vals + min_vals) / 2
+    
+    # Volume
+    volume_pca = torch.prod(half_sizes_pca).item()
+    
+    best_R = R_pca
+    best_half_sizes = half_sizes_pca
+    best_center = center + center_offset_pca @ R_pca.T
+    best_volume = volume_pca
+    
+    # Method 2: Try rotating around principal axes to minimize volume
+    # This is especially important for nearly planar objects
+    n_angles = 24  # Number of angles to try
+    
+    for axis_idx in range(3):
+        for angle_idx in range(n_angles):
+            angle = (angle_idx * 2 * np.pi) / n_angles
+            
+            # Create rotation matrix around axis
+            cos_a = torch.cos(torch.tensor(angle, device=device))
+            sin_a = torch.sin(torch.tensor(angle, device=device))
+            
+            R_rot = torch.eye(3, device=device)
+            if axis_idx == 0:  # Rotate around X
+                R_rot[1, 1] = cos_a
+                R_rot[1, 2] = -sin_a
+                R_rot[2, 1] = sin_a
+                R_rot[2, 2] = cos_a
+            elif axis_idx == 1:  # Rotate around Y
+                R_rot[0, 0] = cos_a
+                R_rot[0, 2] = sin_a
+                R_rot[2, 0] = -sin_a
+                R_rot[2, 2] = cos_a
+            else:  # Rotate around Z
+                R_rot[0, 0] = cos_a
+                R_rot[0, 1] = -sin_a
+                R_rot[1, 0] = sin_a
+                R_rot[1, 1] = cos_a
+            
+            # Apply rotation to PCA basis
+            R_test = R_pca @ R_rot
+            
+            # Project points
+            points_test = points_centered @ R_test
+            
+            # Compute bbox
+            min_vals = points_test.min(dim=0).values
+            max_vals = points_test.max(dim=0).values
+            half_sizes_test = (max_vals - min_vals) / 2
+            center_offset_test = (max_vals + min_vals) / 2
+            
+            # Volume
+            volume_test = torch.prod(half_sizes_test).item()
+            
+            if volume_test < best_volume:
+                best_volume = volume_test
+                best_R = R_test
+                best_half_sizes = half_sizes_test
+                best_center = center + center_offset_test @ R_test.T
+    
+    # Ensure the smallest dimension is along z-axis (for thin objects)
+    # Sort dimensions and reorder axes
+    sorted_indices = torch.argsort(best_half_sizes)
+    best_R = best_R[:, sorted_indices]
+    best_half_sizes = best_half_sizes[sorted_indices]
+    
+    # Ensure right-handed coordinate system after reordering
+    if torch.det(best_R) < 0:
+        best_R[:, 2] = -best_R[:, 2]
+    
+    return best_R, best_center, best_half_sizes
+
 
 def make_local_frame(n: torch.Tensor):
     n = F.normalize(n, dim=0)
@@ -2342,7 +2568,7 @@ def process_global_points(
             n, c, inliers = robust_plane_ransac(P_all, n_avg)
             planarity_ratio = (inliers.float().mean()).item()
             print(f"[{gid}] Using plane-constrained bbox (planarity: {planarity_ratio:.2f})")
-            P = P_all[inliers] if inliers.sum() > 5 else P_all
+            P = P_all[inliers] if inliers.sum() > 50 else P_all
 
             # first try single rectangle
             R_bw1, centre1, half_sz1, rect_ratio = fit_one_plane_box(P, n, c, gid)
@@ -2360,12 +2586,12 @@ def process_global_points(
                 # continue  # go to next gid
 
             # single box path
-            half_sz = half_sz1.clamp(min=0.05)
+            half_sz = half_sz1.clamp(min=0.02)
             R_bw, centre = R_bw1, centre1
 
 
         # clamp & store
-        half_sz = half_sz.clamp(min=0.05)
+        half_sz = half_sz.clamp(min=0.02)
         S_items.append(torch.log(half_sz))
         R_items.append(R_bw.t().contiguous())  # world→body
         T_items.append(centre)
@@ -2510,87 +2736,6 @@ def find_segment_correspondences_improved(
 
 
 
-def snap_contact_to_scene(C, S_list,
-                          theta_tol_deg=5.0, eps_pos=0.005,
-                          A_min=0.0025, L_min=0.03):
-    """
-    C: {'R':(3,3) world->body?, 'T':(3,), 'S':(3,) half sizes}  —— 你的 R_items[i].T 是 body->world；下面我们用 n/world系
-    S_list: list of scene prims with same字段（世界系）
-    返回: (C_snapped, info) 或 (None, {'connected':False})
-    """
-    import numpy as np
-    def plane_from_prim(P):  # 返回法向n与平面偏置d（n·x = d），n朝向取P的第3列
-        Rw = P['R'].T  # 你的存法是 R_items.append(R_bw.t()) → R_items[i].T 是 world->body
-        # 这里我们需要 body->world 的第三轴作为法向(与fit_one_plane_box里一致：R_bw = [x,y,n])
-        n = Rw[:, 2] / np.linalg.norm(Rw[:, 2])
-        d = np.dot(n, P['T'])
-        return n, d
-
-    def ang(a,b):
-        return np.degrees(np.arccos(np.clip(np.abs(np.dot(a,b)), -1, 1)))
-
-    def coplanar_ok(nc, dc, ns, ds):
-        return (ang(nc, ns) <= theta_tol_deg) and (abs(dc - ds) <= eps_pos)
-
-    # 计算 C 的平面
-    nC, dC = plane_from_prim(C)
-
-    # 先尝试共面
-    for Sj in S_list:
-        nS, dS = plane_from_prim(Sj)
-        if not coplanar_ok(nC, dC, nS, dS):
-            continue
-        # 把 C 的平面直接对齐 S 的平面（旋到 ns、平移到 ds）
-        C_aligned = align_prim_to_plane(C, nS, dS)    # 下面再给
-        if overlap_area_on_plane(C_aligned, Sj) >= A_min:
-            return C_aligned, {'connected': True, 'mode': 'coplanar'}
-
-    # 再尝试边连
-    for Sj in S_list:
-        nS, dS = plane_from_prim(Sj)
-        if ang(nC, nS) > theta_tol_deg:
-            continue
-        C_edge_snap = align_prim_edge_to_edge(C, Sj, eps_pos)  # 下面再给
-        if C_edge_snap is not None:
-            if edge_overlap_length(C_edge_snap, Sj) >= L_min:
-                return C_edge_snap, {'connected': True, 'mode': 'edge'}
-
-    return None, {'connected': False}
-
-# 需要的几何小函数（示意，按你的R/T/S定义写）：
-def align_prim_to_plane(P, n_target, d_target):
-    # 把 P 的法向旋到 n_target，并把中心沿法向平移到 d_target
-    import numpy as np
-    Rw = P['R'].T
-    n_src = Rw[:, 2] / np.linalg.norm(Rw[:, 2])
-    v = np.cross(n_src, n_target); s = np.linalg.norm(v)
-    if s < 1e-8:
-        R_align = np.eye(3)
-    else:
-        c = np.dot(n_src, n_target)
-        vx = np.array([[0,-v[2],v[1]],[v[2],0,-v[0]],[-v[1],v[0],0]])
-        R_align = np.eye(3) + vx + vx@vx * ((1-c)/(s**2))
-    Rw_new = Rw @ R_align          # body->world
-    # center沿法向移动到目标平面
-    T = P['T']
-    d_now = np.dot(n_target, T)
-    T_new = T + (d_target - d_now) * n_target
-    return dict(R=Rw_new.T, T=T_new, S=P['S'])
-
-def overlap_area_on_plane(A, B):
-    # 把两个矩形（A,B）的四角点投影到共面坐标系，做2D矩形相交面积（快速近似：AABB on plane basis）
-    # 你已有 make_local_frame / min_area_rect，可重用；这里留作 TODO
-    return 0.05  # placeholder
-
-def align_prim_edge_to_edge(C, S, eps):
-    # 选 C 的四条边与 S 的四条边，找方向平行且最近距离<=eps的组合，面内平移/微旋转吸附
-    # 返回吸附后的 C 或 None（略）
-    return None
-
-def edge_overlap_length(A, B):
-    # 计算吸附边在对方边上的投影重叠长度（略）
-    return 0.05
-
 
 def interval_flow_segmentation_pipeline_with_vis(
     mono_normals: torch.Tensor,  # (T, H, W, 3)
@@ -2602,40 +2747,33 @@ def interval_flow_segmentation_pipeline_with_vis(
     device: str = 'cuda',
     save_debug: bool = True,
     stat_cam: bool = False,
-    contact_points: Optional[np.ndarray] = None,
-    debug_dir: Path = Path('debug_segments')
+    contact_points: Optional[np.ndarray] = None, 
+    debug_dir: Path = Path('debug_segments'),
+    **kwargs: Any,
 ) -> Dict[str, List]:
     """
     Complete pipeline with fixed flow loading and correspondence finding.
     """
-    frame_idx_list = list(frame_indices)
-    num_frames = len(frame_idx_list)
+    num_frames = len(frame_indices)
     H, W = depthmaps.shape[1:3]
-
-    eps_spatial = 2.0
-    if stat_cam:
-        # Static camera / single image sequences only need the first frame.
-        frame_idx_list = [frame_idx_list[0]] if frame_idx_list else [0]
-        num_frames = 1
-
+    
     print(f"Processing {num_frames} frames with resolution {H}x{W}")
-
+    
     # Step 1: Segment each frame independently
     print("\nStep 1: Segmenting individual frames...")
     all_frame_segments = []
     all_seg_maps = []
-
+    
     for i in range(num_frames):
         seg_map, num_segs = segment_single_frame_normals(
             mono_normals[i],
             depthmaps[i],
-            eps_spatial=eps_spatial,
-            n_normal_clusters=8,
+            eps_spatial=2.0,
             min_samples=10,
-            min_points=22,
+            min_points=10,
             device=device
         )
-
+        
         seg_props = compute_segment_properties(
             seg_map,
             mono_normals[i],
@@ -2643,80 +2781,74 @@ def interval_flow_segmentation_pipeline_with_vis(
             pointclouds[i],
             device=device
         )
-
+        
         all_frame_segments.append(seg_props)
         all_seg_maps.append(seg_map)
-        print(f"  Frame {frame_idx_list[i]}: {len(seg_props)} segments")
-
-    if stat_cam:
-        # Single view: treat each local segment as its own global segment.
-        global_segments = build_global_segments_single_view(all_frame_segments)
-        correspondence_pairs: List[Tuple[int, int, int, int]] = []
-    else:
-        # Step 2: Load flow data with proper resizing
-        print("\nStep 2: Loading and resizing flow data...")
-        flow_forward, flow_backward, covis_masks = load_flow_and_covis_data_fixed(
-            data_dir, frame_idx_list, H, W, interval
-        )
-
-        # Optional: visualize flow
-        if save_debug:
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            # batch_visualize_flow_data(flow_forward, flow_backward, covis_masks, debug_dir / 'flow_vis')
-
-        # Step 3: Find correspondences with improved method
-        print("\nStep 3: Finding greedy segment correspondences across ALL frames …")
-        correspondence_pairs = []            # (fi, seg_i, fj, seg_j)
-
-        # map real frame-number → position index 0…num_frames-1
-        frame_to_pos = {f: i for i, f in enumerate(frame_idx_list)}
-
-        for (fi, fj), flow in flow_forward.items():
-            if (fi, fj) not in covis_masks:          # need covis mask too
-                continue
-            i_pos, j_pos = frame_to_pos[fi], frame_to_pos[fj]
-
-            corr = find_segment_correspondences_improved(
-                all_seg_maps[i_pos], all_seg_maps[j_pos],
-                all_frame_segments[i_pos], all_frame_segments[j_pos],
-                flow, covis_masks[(fi, fj)],
-                normal_threshold=0.85,
-                min_overlap_pixels=20,
-                overlap_ratio_threshold=0.01
-            )
-            print(f"  {fi}->{fj}: {len(corr)} matches")
-            for seg_i, seg_j in corr:
-                correspondence_pairs.append((i_pos, seg_i, j_pos, seg_j))
-
-        print(f"\nStep 4: Union-fusing {len(correspondence_pairs)} correspondences …")
-        global_segments = build_global_segments_greedy(
-            all_frame_segments, correspondence_pairs
-        )
-        print(f"  ↳ {len(global_segments)} global segments after greedy fusion")
-        print(f"  Found {len(global_segments)} global segments")
-
-    # Save debug visualizations if requested
+        print(f"  Frame {frame_indices[i]}: {len(seg_props)} segments")
+    
+    # Step 2: Load flow data with proper resizing
+    print("\nStep 2: Loading and resizing flow data...")
+    flow_forward, flow_backward, covis_masks = load_flow_and_covis_data_fixed(
+        data_dir, frame_indices, H, W, interval
+    )
+    
+    # Optional: visualize flow
     if save_debug:
         debug_dir.mkdir(parents=True, exist_ok=True)
+        # You can uncomment this if you want flow visualization
+        # batch_visualize_flow_data(flow_forward, flow_backward, covis_masks, debug_dir / 'flow_vis')
+    
+    # Step 3: Find correspondences with improved method
+    print("\nStep 3: Finding greedy segment correspondences across ALL frames …")
+    correspondence_pairs = []            # (fi, seg_i, fj, seg_j)
+
+    # map real frame-number → position index 0…num_frames-1
+    frame_to_pos = {f: i for i, f in enumerate(frame_indices)}
+
+    for (fi, fj), flow in flow_forward.items():
+        if (fi, fj) not in covis_masks:          # need covis mask too
+            continue
+        i_pos, j_pos = frame_to_pos[fi], frame_to_pos[fj]
+
+        corr = find_segment_correspondences_improved(
+            all_seg_maps[i_pos], all_seg_maps[j_pos],
+            all_frame_segments[i_pos], all_frame_segments[j_pos],
+            flow, covis_masks[(fi, fj)],
+            normal_threshold=0.85,
+            min_overlap_pixels=50,
+            overlap_ratio_threshold=0.1
+        )
+        print(f"  {fi}->{fj}: {len(corr)} matches")
+        for seg_i, seg_j in corr:
+            correspondence_pairs.append((i_pos, seg_i, j_pos, seg_j))
+
+    print(f"\nStep 4: Union-fusing {len(correspondence_pairs)} correspondences …")
+    global_segments = build_global_segments_greedy(
+        all_frame_segments, correspondence_pairs
+    )
+    print(f"  ↳ {len(global_segments)} global segments after greedy fusion")
+    print(f"  Found {len(global_segments)} global segments")
+    
+    # Save debug visualizations if requested
+    if save_debug:
         print("\nSaving debug visualizations...")
-        visualize_per_frame_segments(all_seg_maps, frame_idx_list, debug_dir)
-        visualize_merged_segments(all_seg_maps, global_segments, frame_idx_list, debug_dir)
+        visualize_per_frame_segments(all_seg_maps, frame_indices, debug_dir)
+        visualize_merged_segments(all_seg_maps, global_segments, frame_indices, debug_dir)
         save_segment_statistics(
             all_seg_maps,
             all_frame_segments,
             global_segments,
             correspondence_pairs,
-            frame_idx_list,
+            frame_indices,
             debug_dir
         )
-
+    
     # Step 5: Process global segments into primitives
     print("\nStep 5: Fitting primitives to global segments...")
     results = process_global_segments(
         global_segments,
         all_frame_segments,
         min_frames=2,
-        min_fps_points=100,
         device=device
     )
 
@@ -2724,13 +2856,15 @@ def interval_flow_segmentation_pipeline_with_vis(
     if contact_points is not None and len(contact_points) > 0:
         results_extra = process_global_points(
             torch.from_numpy(contact_points),
-            min_frames=1,
-            min_fps_points=10,
+            min_frames=2,
             device=device
         )
 
     results = merge_primitives_dicts(results, results_extra)
 
-    print(f"\n✓ Generated {len(results['S_items'])} primitives from {len(global_segments)} global segments")
 
+    # process_global_points
+    
+    print(f"\n✓ Generated {len(results['S_items'])} primitives from {len(global_segments)} global segments")
+    
     return results

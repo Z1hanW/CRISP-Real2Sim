@@ -1,0 +1,22 @@
+name: typescript-compile
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  typescript-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Use Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Run tsc
+        run: |
+          cd src/viser/client
+          npm install
+          npx tsc

@@ -10,12 +10,8 @@ eval "$(conda shell.bash hook)"
 
 ROOT_DIR="$1"
 
-# sh 6_align.sh "$ROOT_DIR" tram
 sh 6_align.sh "$ROOT_DIR" gv
-# sh re_glue_sqs.sh "$ROOT_DIR" tram
 sh re_glue_sqs.sh "$ROOT_DIR" gv
-#  sh 8_post_scene_process.sh "$ROOT_DIR" "$HMR_TYPE" 
-# sh 9_train_my_agent.sh "$ROOT_DIR"
 
 
 

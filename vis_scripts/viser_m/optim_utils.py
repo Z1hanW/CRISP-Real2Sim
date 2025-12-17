@@ -156,7 +156,8 @@ def refine_sq_with_lm(
     coverage_weight: float = 1e-3,
     inside_weight: float = 0.1,
     eps_regularization: float = 0.5,
-    verbose: bool = True
+    verbose: bool = True,
+    loss_threshold: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Refine superquadrics using Levenberg-Marquardt-inspired optimization.
@@ -174,6 +175,7 @@ def refine_sq_with_lm(
         inside_weight: Weight for inside loss
         eps_regularization: Weight for epsilon regularization
         verbose: Print progress
+        loss_threshold: Drop primitives whose best loss exceeds this value (None disables filtering)
     
     Returns:
         Tensor of refined parameters (N, 11)
@@ -191,7 +193,24 @@ def refine_sq_with_lm(
     eps_items = results["eps_items"]
     
     N = len(S_items)
-    params_out = torch.empty((N, 11), dtype=torch.float32, device=device)
+    def _pack_params_tensor(
+        eps_param_t: torch.Tensor,
+        S_log_t: torch.Tensor,
+        R_b2w_t: torch.Tensor,
+        T_w_t: torch.Tensor,
+    ) -> torch.Tensor:
+        sx, sy, sz = torch.exp(S_log_t).tolist()
+        R_w2b = R_b2w_t.T
+        rz, ry, rx = matrix_to_euler_angles(R_w2b.unsqueeze(0), "ZYX").squeeze(0).tolist()
+        tx, ty, tz = T_w_t.tolist()
+        return torch.tensor([
+            eps_param_t[0].item(), eps_param_t[1].item(),
+            sx, sy, sz, rz, ry, rx, tx, ty, tz
+        ], dtype=torch.float32, device=device)
+
+    params_out: List[torch.Tensor] = []
+    keep_indices: List[int] = []
+    dropped_indices: List[int] = []
     
     for idx in range(N):
         if verbose:
@@ -223,11 +242,8 @@ def refine_sq_with_lm(
                 rz, ry, rx = matrix_to_euler_angles(R_w2b.unsqueeze(0), "ZYX").squeeze(0).tolist()
                 tx, ty, tz = T_w.tolist()
 
-                params_out[idx] = torch.tensor([
-                    eps_param[0].item(), eps_param[1].item(),
-                    sx, sy, sz, rz, ry, rx, tx, ty, tz
-                ], device=device)
-
+                params_out.append(_pack_params_tensor(eps_param, S_log, R_b2w, T_w))
+                keep_indices.append(idx)
             continue
 
         points_world = pts_src.to(device)
@@ -361,23 +377,40 @@ def refine_sq_with_lm(
                       f"inside={best_state['inside']:.5f}")
         
         # Update results
+        plane_loss = best_loss if best_state is not None else float('inf')
+        drop_plane = False
+        loss_value = float(plane_loss)
+        if loss_threshold is not None:
+            if not math.isfinite(loss_value) or loss_value > loss_threshold:
+                drop_plane = True
+        if drop_plane:
+            dropped_indices.append(idx)
+            if verbose:
+                readable = loss_value if math.isfinite(loss_value) else float('inf')
+                print(f"  Rejecting superquadric {idx+1}: loss={readable:.5f} exceeds threshold {loss_threshold:.5f}")
+            continue
+
         results["eps_items"][idx] = eps_param.cpu()
         results["S_items"][idx] = S_log.cpu()
         results["R_items"][idx] = R_b2w.cpu()
         results["T_items"][idx] = T_w.cpu()
         
-        # Pack output parameters
-        sx, sy, sz = torch.exp(S_log).tolist()
-        R_w2b = R_b2w.T
-        rz, ry, rx = matrix_to_euler_angles(R_w2b.unsqueeze(0), "ZYX").squeeze(0).tolist()
-        tx, ty, tz = T_w.tolist()
-        
-        params_out[idx] = torch.tensor([
-            eps_param[0].item(), eps_param[1].item(),
-            sx, sy, sz, rz, ry, rx, tx, ty, tz
-        ], device=device)
+        params_out.append(_pack_params_tensor(eps_param, S_log, R_b2w, T_w))
+        keep_indices.append(idx)
     
-    return params_out
+    if N > 0 and len(keep_indices) != N:
+        keys_to_filter = ["S_items", "R_items", "T_items", "pts_items", "eps_items"]
+        for key in keys_to_filter:
+            if key not in results:
+                continue
+            seq = results[key]
+            results[key] = [seq[i] for i in keep_indices if i < len(seq)]
+        if verbose:
+            print(f"  Filtered out {len(dropped_indices)} primitives above loss threshold.")
+    
+    if params_out:
+        return torch.stack(params_out, dim=0)
+    return torch.empty((0, 11), dtype=torch.float32, device=device)
 
 
 # Alias for compatibility

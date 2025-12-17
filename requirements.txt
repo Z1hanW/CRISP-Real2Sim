@@ -1,4 +1,5 @@
 av
+transformers==4.57.1
 typed-argument-parser
 hydra-core
 einops
@@ -25,7 +26,17 @@ wis3d
 ultralytics
 pytorch_lightning
 gdown
-git+https://github.com/facebookresearch/pytorch3d.git@stable
 pycolmap
+tyro
 smplx
+toolz
 imageio[ffmpeg]
+pyliblzfse
+scikit-image
+scikit-learn
+vdbfusion
+segment_anything
+nerfstudio
+easydict
+accelerate
+chumpy 

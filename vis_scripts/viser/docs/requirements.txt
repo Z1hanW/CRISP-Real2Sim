@@ -1,0 +1,9 @@
+sphinx==8.0.2
+furo==2024.8.6
+docutils==0.20.1
+toml==0.10.2
+git+https://github.com/brentyi/sphinxcontrib-programoutput.git
+git+https://github.com/brentyi/ansi.git
+git+https://github.com/sphinx-contrib/googleanalytics.git
+playwright==1.40.0
+sphinx-copybutton==0.5.2

@@ -15,6 +15,8 @@ log/
 tmp/
 temp/
 .cache/
+cache/
+viser_output*
 
 # ===== 结果、实验输出（主仓库级别）=====
 results/
@@ -43,3 +45,58 @@ datasets/
 .DS_Store
 .idea/
 .vscode/
+
+# ===== Python 常见编译产物 =====
+__pycache__/
+*.py[cod]
+*.so
+
+# ===== 构建产物（主仓库自己的，不影响 prep/AutoMask/ 那个子模块）=====
+build/
+dist/
+*.egg-info/
+
+# ===== 日志 & 临时文件 =====
+logs/
+log/
+*.log
+tmp/
+temp/
+.cache/
+
+# ===== 结果、实验输出（主仓库级别）=====
+results/
+result/
+outputs/
+output/
+runs/
+checkpoints/
+weights/
+models/
+*.npy
+*.npz
+*.pth
+*.ckpt
+
+# ===== 数据（大文件，主仓库级别）=====
+data/
+datasets/
+*.h5
+*.hdf5
+*.pkl
+
+# ===== 编辑器、OS 文件 =====
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+
+# local node env
+.nodeenv/
+
+# local node env
+.nodeenv/
+
+# local node env
+.nodeenv/

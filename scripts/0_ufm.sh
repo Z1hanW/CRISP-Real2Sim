@@ -1,18 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
+cd ../prep/MogeSAM
 
-###############################################################################
-# 0) Usage
-#    ./run_masks.sh /path/to/dataset_root          # no trailing “_img”
-###############################################################################
-conda activate interactVLM
-cd /data3/zihanwa3/_Robotics/_vision/InteractVLM
-###############################################################################
-# 1) Conda ‑‑ activate env
-###############################################################################
-eval "$(conda shell.bash hook)"
-conda activate ufm
-cd /data3/zihanwa3/_Robotics/_scripts/_priors
 ###############################################################################
 # 2) Paths
 ###############################################################################
@@ -54,6 +41,7 @@ worker() {
             python ufm.py \
                 --images "$cam_folder" \
                 --stride 7 \
+                --out "../../results/init/flows/$seq" \
                 --mode window --window 4
     done
 }

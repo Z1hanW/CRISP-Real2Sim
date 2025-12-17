@@ -1,0 +1,114 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+exclude = ["src/viser/client/.nodeenv", "src/viser/client/node_modules", "**/__pycache__/**"]
+# Client build is in the gitignore, but we still want it in the distribution.
+ignore-vcs = true
+
+[tool.hatch.version]
+path = "src/viser/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src/viser"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/viser"]
+
+[project]
+name = "viser"
+dynamic = ["version"]
+description = "3D visualization + Python"
+readme = "README.md"
+license = { text="MIT" }
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent"
+]
+dependencies = [
+    "requests>=2.0.0,<3.0.0",
+    "websockets>=13.1,<16.0.0",
+    "numpy>=1.0.0,<3.0.0",
+    "msgspec>=0.18.6,<1.0.0",
+    "imageio>=2.0.0,<3.0.0",
+    "tqdm>=4.0.0,<5.0.0",
+    "rich>=13.3.3,<15.0.0",
+    "trimesh>=3.21.7,<5.0.0",
+    "yourdfpy>=0.0.53,<1.0.0",
+    "typing_extensions>=4.0.0",
+    "nodeenv>=1.9.1,<2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyright>=1.1.308",
+    "ruff>=0.9.3",
+    "pre-commit==3.3.2",
+    "pytest",
+    "hypothesis[numpy]",
+    "opencv-python>=4.0.0.21,<5.0.0",
+    "psutil>=5.9.5,<8.0.0",
+]
+examples = [
+    "torch>=1.13.1",
+    "matplotlib>=3.7.1",
+    "plotly>=5.21.0",
+    "robot_descriptions>=1.18.0",
+    "gdown>=4.6.6",
+    "plyfile",
+    "opencv-python",
+    "pyliblzfse>=0.4.1; platform_system!='Windows'",
+    "pandas",  # https://github.com/nerfstudio-project/viser/issues/457
+    "tyro>=0.2.0,<1.0.0",
+]
+
+[project.urls]
+"GitHub" = "https://github.com/nerfstudio-project/viser"
+
+[project.scripts]
+viser-build-client = "viser._client_autobuild:build_client_entrypoint"
+
+[tool.pyright]
+extraPaths = []
+exclude = ["./docs/**/*", "./examples/assets/**/*", "./src/viser/client/.nodeenv", "./build"]
+
+[tool.ruff]
+lint.select = [
+    "E",  # pycodestyle errors.
+    "F",  # Pyflakes rules.
+    "PLC",  # Pylint convention warnings.
+    "PLE",  # Pylint errors.
+    "PLR",  # Pylint refactor recommendations.
+    "PLW",  # Pylint warnings.
+    "I",  # Import sorting.
+]
+lint.ignore = [
+    "E731",  # Do not assign a lambda expression, use a def.
+    "E741",  # Ambiguous variable name. (l, O, or I)
+    "E501",  # Line too long.
+    "E721",  # Do not compare types, use `isinstance()`.
+    "F722",  # Forward annotation false positive from jaxtyping. Should be caught by pyright.
+    "F821",  # Forward annotation false positive from jaxtyping. Should be caught by pyright.
+    "PLR2004",  # Magic value used in comparison.
+    "PLR0915",  # Too many statements.
+    "PLR0913",  # Too many arguments.
+    "PLC0414",  # Import alias does not rename variable. (this is used for exporting names)
+    "PLC0415",  # Import should be at the top-level of a file.
+    "PLC1901",  # Use falsey strings.
+    "PLR5501",  # Use `elif` instead of `else if`.
+    "PLR0911",  # Too many return statements.
+    "PLR0912",  # Too many branches.
+    "PLW0603",  # Global statement updates are discouraged.
+    "PLW2901",  # For loop variable overwritten.
+    "PLW0642",  # Reassigned self in instance method.
+]
+exclude = [ ".nodeenv" ]

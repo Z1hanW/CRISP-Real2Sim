@@ -33,4 +33,17 @@ pip install -e .
 mkdir -p inputs
 mkdir -p outputs
 gdown --folder "https://drive.google.com/drive/folders/1eebJ13FUEXrKBawHpJroW0sNSxLjh9xD" -O inputs/ --remaining-ok --continue
+cd .. 
 
+### for Contact-Predictor
+cd Contact-Predictor
+sh fetch_data.sh
+cd .. 
+
+### for UFM
+cd UFM
+cd UniCeption 
+pip install -e .
+cd ..
+pip install -e .
+cd ..

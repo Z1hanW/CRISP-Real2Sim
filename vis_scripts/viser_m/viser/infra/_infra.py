@@ -255,6 +255,7 @@ class WebsockServer(WebsockMessageHandler):
 
         self._client_state_from_id: dict[int, _ClientHandleState] = {}
         self._server_thread: threading.Thread | None = None
+        self._stop_called: bool = False
 
     def start(self) -> None:
         """Start the server."""
@@ -282,12 +283,26 @@ class WebsockServer(WebsockMessageHandler):
 
     def stop(self) -> None:
         """Stop the server."""
-        assert self._background_event_loop is not None
-        assert self._stop_event is not None
-        assert self._server_thread is not None
+        if self._stop_called:
+            return
+
+        loop = self._background_event_loop
+        stop_event = self._stop_event
+        server_thread = self._server_thread
+
+        # If the server never started (or was already cleaned up), exit quietly.
+        if loop is None or stop_event is None or server_thread is None:
+            return
+
+        self._stop_called = True
 
         # Signal the background thread to stop.
-        self._background_event_loop.call_soon_threadsafe(self._stop_event.set)
+        try:
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(stop_event.set)
+        except RuntimeError:
+            # Event loop may already be closed during interpreter shutdown.
+            pass
 
         # Clean up the message buffers. This isn't really necessary, but helps
         # avoid "task destroyed" errors.
@@ -296,7 +311,8 @@ class WebsockServer(WebsockMessageHandler):
             client.message_buffer.set_done()
 
         # Wait for the server thread to finish.
-        self._server_thread.join(timeout=0.1)
+        if server_thread.is_alive():
+            server_thread.join(timeout=0.1)
 
     def on_client_connect(
         self, cb: Callable[[WebsockClientConnection], None | Coroutine]

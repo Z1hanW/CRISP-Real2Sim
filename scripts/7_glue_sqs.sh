@@ -1,86 +1,92 @@
 #!/usr/bin/env bash
-set -eo pipefail
+set -euo pipefail
 
-################################################################################
-# 1) Make sure conda’s shell functions are available in this script:
-eval "$(conda shell.bash hook)"
 
-# --------------------- helpers ---------------------
-# 打印并在指定 GPU 上运行 python 脚本（单进程独占该 GPU）
-run_demo() {
-  local gpu="$1"; shift
-  local script="$1"; shift
-  echo "[$(date +'%F %T')] [GPU ${gpu}] Run: $script $*"
-  CUDA_VISIBLE_DEVICES="$gpu" python "$script" "$@" || \
-    echo "[$(date +'%F %T')] [GPU ${gpu}] Error: $script $*"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+echo $REPO_ROOT
+VISER_DIR="$REPO_ROOT/vis_scripts/viser_m"
+VIS_SCRIPT="$VISER_DIR/vis.sh"
+DATA_ROOT="$REPO_ROOT/data"
+
+usage() {
+  cat <<'EOF'
+Usage: sh 7_glue_sqs.sh <split_or_path> [hmr_type]
+
+Examples:
+  sh 7_glue_sqs.sh rebuttal gv
+  sh 7_glue_sqs.sh ../data/rebuttal_img
+
+The script will invoke vis_scripts/viser_m/vis.sh with save mode enabled for
+each sequence directory inside the provided *_img split.
+EOF
 }
 
-# 发现可用 GPU：优先用 CUDA_VISIBLE_DEVICES，否则用 nvidia-smi
-discover_gpus() {
-  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-    IFS=',' read -r -a GPU_IDS <<< "$CUDA_VISIBLE_DEVICES"
-  else
-    mapfile -t GPU_IDS < <(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null || echo 0)
-  fi
-  NUM_GPUS="${#GPU_IDS[@]}"
-  if (( NUM_GPUS == 0 )); then
-    echo "No GPUs found. Set CUDA_VISIBLE_DEVICES or ensure nvidia-smi is available."
-    exit 1
-  fi
-  echo "Using GPUs: ${GPU_IDS[*]}"
-}
+if [[ $# -lt 1 ]]; then
+  usage >&2
+  exit 1
+fi
 
-# 等待直到有一个 GPU 空闲，返回该 GPU 的索引（在 GPU_IDS 数组中的下标）
-wait_for_free_gpu() {
-  while true; do
-    for i in "${!GPU_IDS[@]}"; do
-      local pid="${GPU_PIDS[$i]:-}"
-      if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
-        echo "$i"
-        return
-      fi
-    done
-    sleep 1
-  done
-}
-
-# Ctrl-C 时干净地结束所有子进程
-trap 'echo "Stopping..."; jobs -pr | xargs -r kill; wait' INT TERM
-
-# --------------------- main ---------------------
-conda activate sqs
-cd /data3/zihanwa3/_Robotics/_geo/differentiable-blocksworld
-
-# 参数
-DATA_PATH="${1}_img"
-HMR_TYPE="${2}"
-SCRIPT="viser_m/visualizer_demo_ours.py"
+SPLIT_INPUT="${1%/}"
+HMR_TYPE="${2:-gv}"
 LOG_DIR="${LOG_DIR:-/tmp/vis_megasam_logs}"
 mkdir -p "$LOG_DIR"
 
-discover_gpus
-declare -a GPU_PIDS  # 按 GPU 索引记录当前在该 GPU 上跑的 PID
+declare -a CANDIDATES=(
+  "$SPLIT_INPUT"
+  "${SPLIT_INPUT}_img"
+  "$REPO_ROOT/$SPLIT_INPUT"
+  "$REPO_ROOT/${SPLIT_INPUT}_img"
+  "$DATA_ROOT/$SPLIT_INPUT"
+  "$DATA_ROOT/${SPLIT_INPUT}_img"
+)
 
-shopt -s nullglob
-for folder in "$DATA_PATH"/*/; do
-  seq="$(basename "$folder")"
-
-  # 找到一个空闲 GPU（如果都忙就等待）
-  idx="$(wait_for_free_gpu)"
-  gpu="${GPU_IDS[$idx]}"
-  logfile="${LOG_DIR}/${seq}.log"
-
-  # 在该 GPU 上后台跑，并把 PID 记到对应槽位；输出单独写日志文件
-  (
-    run_demo "$gpu" "$SCRIPT" \
-      --data "/data3/zihanwa3/_Robotics/_vision/mega-sam/postprocess/${seq}_${HMR_TYPE}_sgd_cvd_hr.npz"
-  ) >"$logfile" 2>&1 &
-
-  GPU_PIDS[$idx]=$!
-  echo "Launched ${seq} on GPU ${gpu} (PID ${GPU_PIDS[$idx]}), log: $logfile"
+DATA_PATH=""
+for candidate in "${CANDIDATES[@]}"; do
+  [[ -z "$candidate" ]] && continue
+  if [[ -d "$candidate" ]]; then
+    DATA_PATH="$(cd "$candidate" && pwd)"
+    break
+  fi
 done
 
-# 等全部任务结束
-wait
-conda deactivate
-echo "All demos completed successfully."
+if [[ -z "$DATA_PATH" ]]; then
+  echo "Could not locate data directory for '$SPLIT_INPUT'." >&2
+  exit 1
+fi
+
+if [[ ! -x "$VIS_SCRIPT" ]]; then
+  echo "vis.sh not found at $VIS_SCRIPT" >&2
+  exit 1
+fi
+
+pushd "$VISER_DIR" >/dev/null
+
+shopt -s nullglob
+seq_dirs=("$DATA_PATH"/*/)
+shopt -u nullglob
+
+if (( ${#seq_dirs[@]} == 0 )); then
+  echo "No sequence folders found under $DATA_PATH" >&2
+  popd >/dev/null
+  exit 1
+fi
+
+echo "Found ${#seq_dirs[@]} sequences in $DATA_PATH. Logs -> $LOG_DIR"
+
+for seq_dir in "${seq_dirs[@]}"; do
+  seq_name="$(basename "${seq_dir%/}")"
+  results_file="$REPO_ROOT/results/output/scene/${seq_name}_${HMR_TYPE}_sgd_cvd_hr.npz"
+  if [[ ! -f "$results_file" ]]; then
+    echo "Skipping ${seq_name}: missing results file $results_file" >&2
+    continue
+  fi
+
+  logfile="${LOG_DIR}/${seq_name}.log"
+  echo "[$(date +'%F %T')] Running vis.sh for ${seq_name} (log: $logfile)"
+  HMR_TYPE="$HMR_TYPE" SAVE_MODE=on bash "$VIS_SCRIPT" "$seq_name" >"$logfile" 2>&1
+done
+
+popd >/dev/null
+
+echo "All visualizations completed successfully."

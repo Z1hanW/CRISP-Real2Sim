@@ -65,7 +65,7 @@ import numpy as np
 
 import torch
 import torch.nn.functional as F
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Literal
 
 from pytorch3d.structures import Meshes
 
@@ -938,6 +938,11 @@ def main(
     transfer_data: bool = False, 
     hmr_type: str = 'gv',
     moge_base_path: Path | str | None = None,
+    detailed_planes: bool = False,
+    segment_mode: Literal["frame_union", "cluster_3d"] = "frame_union",
+    static_camera: bool = False,
+    sq_loss_threshold: Optional[float] = None,
+    save_clustering: bool = True,
 ) -> None:
     from pathlib import Path  # <-- Import Path here if not already imported
     tgt_name = str(data).split('_sgd')[0].split('/')[-1]   # gives 'MPH112_00169_01_tram'
@@ -1918,7 +1923,7 @@ def main(
             )
 
     if TTTTTTEST == False:
-        interval = 7 # 7# 30#stttride=  (num_frames // 90) + 1
+        interval = 7# 30#stttride=  (num_frames // 90) + 1
         frame_indices = []  # Track which frames we're processing
         if debug:
           num_frames = interval+1
@@ -1930,6 +1935,8 @@ def main(
             interval = 6
 
         interval = 7
+
+        print(interval, 'interval')
 
         times_list = list(range(0, num_frames, interval))
         num_processed_frames = len(times_list)
@@ -2265,11 +2272,19 @@ def main(
         bg_positions = onp.concatenate(bg_positions, axis=0)
         bg_colors = onp.concatenate(bg_colors, axis=0)
 
-        depthmaps = np.array(depths)
+        depthmaps_np = np.array(depths)
+        if static_camera and depthmaps_np.size > 0:
+            valid_mask = np.isfinite(depthmaps_np) & (depthmaps_np > 0)
+            summed = np.where(valid_mask, depthmaps_np, 0.0).sum(axis=0)
+            counts = valid_mask.sum(axis=0)
+            avg_depth = np.zeros_like(depthmaps_np[0])
+            np.divide(summed, np.maximum(counts, 1), out=avg_depth, where=counts > 0)
+            # Reuse the averaged depth map for every frame so downstream code sees consistent shapes.
+            depthmaps_np = np.broadcast_to(avg_depth, depthmaps_np.shape).copy()
         R_cam = np.array(rotations)
         T_cam = np.array(translations)
 
-        depthmaps = torch.tensor(np.array(depths), device=device, dtype=torch.float32)
+        depthmaps = torch.tensor(depthmaps_np, device=device, dtype=torch.float32)
         R_cam = torch.tensor(np.array(rotations), device=device, dtype=torch.float32)
         T_cam = torch.tensor(np.array(translations), device=device, dtype=torch.float32)
         mono_normals = torch.tensor(np.array(mono_normals), device=device, dtype=torch.float32)
@@ -2329,10 +2344,13 @@ def main(
             mono_normals = mono_normals.to(device)
         
 
-        root = FLOWS_COVISIBILITY_DIR
-        data_dir = root / Path(tgt_name)
-        debug_dir = Path('./')
-
+    root = FLOWS_COVISIBILITY_DIR
+    data_dir = root / Path(tgt_name)
+    debug_dir = Path('./')
+    REPO_ROOT = Path('./')
+    if save_clustering:
+        cluster_dump_dir = (REPO_ROOT / "vis" / tgt_name / hmr_type)
+        cluster_dump_dir.mkdir(parents=True, exist_ok=True)
 
         all_frame_mode = False
 
@@ -2342,19 +2360,35 @@ def main(
         except: 
           contact_points = None 
 
-        results = interval_flow_segmentation_pipeline_with_vis(
-            mono_normals=mono_normals,
-            depthmaps=depthmaps,
-            pointclouds=pointclouds, ### 
-            data_dir=data_dir,
-            frame_indices=frame_indices,
-            interval=interval,
-            device=device,
-            save_debug=False,
-            debug_dir=debug_dir,
-            contact_points=None,
-            stat_cam=single_image
-        )
+        print(f"[segment] Running '{segment_mode}' segmentation pipeline")
+        if segment_mode == "cluster_3d":
+            results = cluster_pointcloud_pipeline(
+                pointclouds=pointclouds,
+                normals=mono_normals,
+                device=device,
+                min_cluster_points=200 if detailed_planes else 400,
+                coarse_clusters=160,
+                fine_eps=0.2,
+                normal_weight=0.3,
+                roundness_threshold=0.6,
+                planar_threshold=0.12,
+            )
+        else:
+            results = interval_flow_segmentation_pipeline_with_vis(
+                mono_normals=mono_normals,
+                depthmaps=depthmaps,
+                pointclouds=pointclouds, ### 
+                data_dir=data_dir,
+                frame_indices=frame_indices,
+                interval=interval,
+                device=device,
+                save_debug=False,
+                debug_dir=debug_dir,
+                contact_points=None,
+                stat_cam=(static_camera or single_image),
+                detailed_planes=detailed_planes,
+                cluster_dump_dir=cluster_dump_dir,
+            )
 
         '''
         results = add_scene_grounded_per_part_planes(
@@ -2390,13 +2424,14 @@ def main(
         ### 
         max_iter = 1 if transfer_data else int(4e0)
       
-        
+        sq_loss_threshold = None #1e-2 # if transfer_data else 5e-4
         params = refine_sq_with_chamfer(
             results,
             lr=0,
             mesh_level=3,
             max_iter=max_iter,
-            device="cuda"
+            device="cuda",
+            loss_threshold=sq_loss_threshold,
         )
             
 
@@ -2552,13 +2587,9 @@ def main(
             scene_mesh = scene_mesh = trimesh.util.concatenate(mesh_parts)
           except:
             sfasjfaf =5 '''
-            
-          # scene_mesh.export('')
 
           dst_path = tgt_folder.replace('_geo/differentiable-blocksworld', '_vision/mega-sam')
           BIGBIG_folder_tgt = BIGBIG_folder.replace('_geo/differentiable-blocksworld', '_vision/mega-sam')
-          # if Path(BIGBIG_folder_tgt).exists():
-          #    shutil.rmtree(BIGBIG_folder_tgt)
           shutil.copytree(BIGBIG_folder, BIGBIG_folder_tgt, dirs_exist_ok=True)
         print('done!')
 
