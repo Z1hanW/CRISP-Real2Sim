@@ -542,7 +542,7 @@ def process_gv_smpl(
     world_cam_R: torch.Tensor,
     world_cam_T: torch.Tensor,
     max_frames: int,
-    smpl_model,
+    smpl_model = None, # legacy. 
     use_world: bool = True,
     device: str = 'cuda'
 ) -> Dict[str, torch.Tensor]:

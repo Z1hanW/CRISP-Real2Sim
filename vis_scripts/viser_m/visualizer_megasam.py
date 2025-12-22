@@ -21,7 +21,7 @@ from sklearn.cluster import MiniBatchKMeans        # fast & GPU‑friendly via t
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm  # For colormap
 import smplx
-from smpl import SMPL, BodyModelSMPLH, BodyModelSMPLX
+
 import torch
 import os
 import cv2
@@ -97,7 +97,6 @@ def _sanitize_trimesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
         F2 = F[np.all(finite[F], axis=1)]
         F2 = map_idx[F2]
         mesh = trimesh.Trimesh(V2, F2, process=False)
-    mesh.remove_degenerate_faces()
     mesh.remove_unreferenced_vertices()
     return mesh
 
@@ -1027,48 +1026,24 @@ def main(
         process_gv_smpl,
         load_contact_ids_from_file,
         load_contact_ids_with_mode, 
-        filter_vertices_by_contact,
-        vis_hmr,
-        #analyze_motion,
-        #filter_stable_contacts_simple,
-        #inspect_contact_points, 
-        #pick_best_frames_per_segment, 
-        #analyze_contacts_per_body_part
+        filter_vertices_by_contact
     )
     
 
     device='cuda'
-    smpl = SMPL().to(device)
+
     interact_contact_path = str(CONTACTS_ROOT / tgt_name)
 
 
     
-    if hmr_type == 'tram':
-        smpl_results = process_tram_smpl(
-            tgt_name=tgt_name,
-            world_cam_R=world_cam_R,
-            world_cam_T=world_cam_T,
-            max_frames=max_frames,
-            smpl_model=smpl,
-            device='cuda'
-        )
-        
-        num_frames = smpl_results['num_frames']
-        global_orient_world = smpl_results['global_orient_world']
-        transl_world = smpl_results['transl_world']
-        pred_vert = smpl_results['pred_vert'].cpu().numpy()
-        pred_j3dg = smpl_results['pred_j3dg']
-        body_pose = smpl_results['body_pose']
-        pred_shapes = smpl_results['pred_shapes']
-        faces = smpl_results['faces']
 
-    elif hmr_type == 'gv':
+    if hmr_type == 'gv':
         smpl_results = process_gv_smpl(
             tgt_name=tgt_name,
             world_cam_R=world_cam_R,
             world_cam_T=world_cam_T,
             max_frames=max_frames,
-            smpl_model=smpl,
+            smpl_model=None,
             use_world=use_world,
             device='cuda'
         )
@@ -1272,7 +1247,6 @@ def main(
     if 'pkr' or 'IMG_' in tgt_name:
       every = 1
 
-    vis_hmr(results, org_vis, device, every=every)
     np.save(hmr_dir / 'hps_track.npy', results)
     human_transl_np = transl_world.detach().cpu().numpy()
 
@@ -1745,7 +1719,7 @@ def main(
             combined_mesh = trimesh.util.concatenate(meshes)
             # Clean up the combined mesh
             combined_mesh.remove_duplicate_faces()
-            combined_mesh.remove_degenerate_faces()
+            # combined_mesh.remove_degenerate_faces()
             return combined_mesh
         else:
             # Return list of individual meshes
@@ -2231,7 +2205,7 @@ def main(
                 human_mesh_handle = server.scene.add_mesh_simple(
                     name=f"/frames/t{i}/human_mesh",
                     vertices=pred_vert[[i]],
-                    faces=smpl.faces,
+                    faces=faces,
                     flat_shading=False,
                     wireframe=False,
                     color=mesh_color,
@@ -2449,7 +2423,7 @@ def main(
 
 
     optim = True
-    coacd = True
+    coacd = False
     filtering = True
     contact_only = False
     tri_mesh_handle=None
@@ -2539,19 +2513,6 @@ def main(
 
         prev_sq_idx = 0        # 保持当前可见索引
 
-        if scene_mesh_contact is not None:
-            scene_mesh_coacd_handle = server.scene.add_mesh_trimesh(
-                name="/frames/0/scene_mesh_coacd",
-                mesh=scene_mesh_contact.copy(),
-            )
-            scene_mesh_coacd_handle.visible = gui_show_scene_coacd.value
-
-            if contact_vertices_handles:
-                scene_mesh_coacd_contact_handle = server.scene.add_mesh_trimesh(
-                    name="/frames/0/scene_mesh_coacd_contact",
-                    mesh=scene_mesh_contact,
-                )
-                scene_mesh_coacd_contact_handle.visible = gui_show_scene_coacd_contact.value
 
         os.makedirs(tgt_folder, exist_ok=True)
         tgt_folder = os.path.join(tgt_folder, hmr_type)
@@ -2566,27 +2527,6 @@ def main(
         save_custom_mesh(per_sq_one_list, tgt_folder)
         
         if transfer_data:
-          '''try:
-            mesh = coacd.Mesh(mesh.vertices, mesh.faces)
-            result = coacd.run_coacd(mesh,
-                              merge=False,
-                              threshold=0.02, # threshold=0.01, 
-                              preprocess_resolution=150,
-                              # preprocess_resolution=80, #  50 by d
-                              # max_ch_vertex=256, # max_ch_vertex=512  default = 256
-                              resolution=4000, #resolution=200000
-                              max_convex_hull=100)
-            mesh_parts = []
-            for vs, fs in result:
-                mesh_parts.append(trimesh.Trimesh(vs, fs))
-            scene = trimesh.Scene()
-            np.random.seed(0)
-            for p in mesh_parts:
-                # p.visual.vertex_colors[:, :3] = (np.random.rand(3) * 255).astype(np.uint8)
-                scene.add_geometry(p)
-            scene_mesh = scene_mesh = trimesh.util.concatenate(mesh_parts)
-          except:
-            sfasjfaf =5 '''
 
           dst_path = tgt_folder.replace('_geo/differentiable-blocksworld', '_vision/mega-sam')
           BIGBIG_folder_tgt = BIGBIG_folder.replace('_geo/differentiable-blocksworld', '_vision/mega-sam')

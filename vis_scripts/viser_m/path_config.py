@@ -1,14 +1,6 @@
 from __future__ import annotations
 
-"""
-Centralized filesystem locations for the viser_m visualizers.
 
-The original code relied on hard-coded absolute paths under
-/data3/zihanwa3/_Robotics.  We now resolve everything relative to the
-repository root so the scripts work when the results/ directory is
-relocated.  Drop new datasets under results/init and update this file
-only if the layout changes further.
-"""
 
 from pathlib import Path
 import os
@@ -17,9 +9,9 @@ import os
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
-SMPL_DATA_PATH = "/data3/zihanwa3/_Robotics/__release/prep"
+SMPL_DATA_PATH = "../../prep"
 
-REPO_ROOT = Path("/data3/zihanwa3/_Robotics/__release/prep")# _repo_root()
+REPO_ROOT = Path(SMPL_DATA_PATH)# _repo_root()
 REPO_SMPL_DATA_DIR = REPO_ROOT / "data" / "smpl"
 
 

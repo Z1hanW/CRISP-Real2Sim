@@ -36,9 +36,9 @@ gdown --folder "https://drive.google.com/drive/folders/1eebJ13FUEXrKBawHpJroW0sN
 cd .. 
 
 ### for Contact-Predictor
-cd Contact-Predictor
-sh fetch_data.sh
-cd .. 
+#cd Contact-Predictor
+#sh fetch_data.sh
+#cd .. 
 
 ### for UFM
 cd UFM

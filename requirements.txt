@@ -16,7 +16,6 @@ imageio
 trimesh
 huggingface_hub
 python-box[all]~=7.0
-timm
 wandb
 transformers
 colorlog
@@ -39,4 +38,4 @@ segment_anything
 nerfstudio
 easydict
 accelerate
-chumpy 
+yacs

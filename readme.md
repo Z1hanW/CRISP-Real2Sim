@@ -30,6 +30,10 @@ pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 "xformers>=0.0.27
   --index-url https://download.pytorch.org/whl/cu124
 pip install torch-scatter -f https://data.pyg.org/whl/torch-2.4.1+cu124.html
 pip install -r requirements.txt
+pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git@stable"
+python -m pip install -U timm
+pip install numpy==1.26.4
+python -m pip install --no-build-isolation "git+https://github.com/mattloper/chumpy.git"
 ```
 
 > If you encounter compilation errors (usually on `pytorch3d` or CUDA extensions), install a compatible compiler toolchain: `conda install -c conda-forge gxx_linux-64=11`.
@@ -93,9 +97,15 @@ sh all_gv.sh /path/to/data/demo        # not /path/to/data/demo_videos
 ---
 
 ## 4. Visualize Human–Scene Reconstructions
-
+Compile viser
 ```bash
-sh vis.sh ${SEQ_NAME}
+cd __release/vis_scripts/viser_m
+pip install -e .
+```
+
+Visualize your sequences (e.g. wall-kicking)
+```bash
+bash vis.sh ${SEQ_NAME}
 ```
 
 Common flags (see script header for the full list):
