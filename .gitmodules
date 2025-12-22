@@ -8,3 +8,6 @@
 [submodule "prep/HMR"]
 	path = prep/HMR
 	url = https://github.com/CRISP-Real2Sim/HMR.git
+[submodule "prep/UFM"]
+	path = prep/UFM
+	url = https://github.com/UniFlowMatch/UFM
