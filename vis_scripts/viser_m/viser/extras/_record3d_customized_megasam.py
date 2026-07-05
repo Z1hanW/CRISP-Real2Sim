@@ -304,17 +304,26 @@ class Record3dLoader_Customized_Megasam:
 
     def __init__(self, npz_data: dict, npz_cam_data: dict, conf_threshold: float = 1.0, foreground_conf_threshold: float = 0.1, no_mask: bool = False, xyzw=True, init_conf=False, extra_obj=False):
         # Assuming npz_data is a dictionary containing all the necessary arrays from the NPZ file
-        self.K = np.expand_dims(npz_cam_data['intrinsic'], 0)
-        aaaa=1
-        ax, ay = 1, 1#640/295.5, 360/166
+        num_frames = npz_data['images'].shape[0]
+        intrinsic = np.asarray(
+            npz_cam_data.get('intrinsics_per_frame', npz_cam_data['intrinsic']),
+            dtype=np.float32,
+        )
+        if intrinsic.ndim == 2:
+            self.K = np.repeat(intrinsic[None], num_frames, axis=0)
+        elif intrinsic.ndim == 3:
+            if intrinsic.shape[0] == 1 and num_frames > 1:
+                self.K = np.repeat(intrinsic, num_frames, axis=0)
+            elif intrinsic.shape[0] == num_frames:
+                self.K = intrinsic.copy()
+            else:
+                raise ValueError(
+                    f"Intrinsics frame count mismatch: K={intrinsic.shape}, images={npz_data['images'].shape}"
+                )
+        else:
+            raise ValueError(f"Expected intrinsics shaped (3,3) or (T,3,3), got {intrinsic.shape}")
 
-        self.K[0][0][0], self.K[0][0][-1], self.K[0][1][1], self.K[0][1][-1]  = ax *self.K[0][0][0], ax * self.K[0][0][-1], ay*self.K[0][1][1], ay*self.K[0][1][-1]
-
-        self.K[0][1][1] = self.K[0][0][0]
-
-        
         self.S = npz_cam_data['scale']
-        self.K = np.repeat(self.K, npz_data['images'].shape[0], axis=0) # (1,3,3) -> (N,3,3)
         
         T_world_cameras = npz_cam_data['cam_c2w'].copy()
         T_world_cameras[..., :3, 3] *= self.S  # scale only the translation part
@@ -342,7 +351,15 @@ class Record3dLoader_Customized_Megasam:
         self.masks = npz_data.get('enlarged_dynamic_mask', [])
         self.obj_masks = npz_data.get('obj_masks', [])
 
-        self.confidences = np.array(npz_data.get('uncertainty', []))
+        if 'uncertainty' in npz_data:
+            self.confidences = np.array(npz_data['uncertainty'])
+            self.confidence_source = 'uncertainty'
+        elif 'depth_conf' in npz_data:
+            self.confidences = np.array(npz_data['depth_conf'])
+            self.confidence_source = 'depth_conf'
+        else:
+            self.confidences = np.array([])
+            self.confidence_source = ''
         
         self.masks = cast(
             np.ndarray,
@@ -365,12 +382,18 @@ class Record3dLoader_Customized_Megasam:
         
 
         if len(self.confidences):
-          ssshapes= self.confidences.shape
-          #self.confidences = self.confidences[self.masks==0]
-
-          self.conf_threshold = np.quantile(self.confidences, 0.0)
+          finite_conf = self.confidences[np.isfinite(self.confidences)]
+          if finite_conf.size == 0:
+            self.conf_threshold = conf_threshold
+          elif self.confidence_source == 'depth_conf':
+            # VGGT-Omega's official viewer keeps points above a confidence
+            # percentile. Use the same default 20th percentile here.
+            q = float(os.environ.get("CRISP_DEPTH_CONF_QUANTILE", "0.2"))
+            self.conf_threshold = np.quantile(finite_conf, np.clip(q, 0.0, 1.0))
+          else:
+            self.conf_threshold = np.quantile(finite_conf, 0.0)
         else: 
-          self.conf_threshold = conf_threshold
+          self.conf_threshold = 0.0
 
 
         # Align all camera poses by the first frame
@@ -414,7 +437,10 @@ class Record3dLoader_Customized_Megasam:
 
 
         if len(self.obj_masks) == 0:
-            obj_mask = np.ones_like(depth, dtype=bool)
+            # Missing object masks should mean "no object mask available", not
+            # "every pixel is object". Using all-ones here wipes the entire
+            # background and makes scene reconstruction empty.
+            obj_mask = np.zeros_like(depth, dtype=bool)
         else:
             obj_mask = self.obj_masks[index] > 0  # Assuming mask is a binary image
 
@@ -515,6 +541,7 @@ class Record3dFrame:
             skimage.transform.resize(self.obj_mask, rgb.shape[:2], order=0),
         )
         mask = dilation(mask, disk(11))
+        obj_mask = dilation(obj_mask, disk(11))
     
   
         assert depth.shape == rgb.shape[:2]
@@ -592,7 +619,7 @@ class Record3dFrame:
         mean_plus_3std = np.quantile(depth, 0.8)
         mask4 = depth > mean_plus_3std
 
-        joint_mask = mask1  | mask2 | mask4 #| mask3 #| mask4
+        joint_mask = mask1 | obj_mask | mask2 | mask4 #| mask3 #| mask4
 
         fg_indices = fg_conf_mask & mask
         fg_homo_grid = np.pad(grid[fg_indices], ((0, 0), (0, 1)), constant_values=1)
@@ -614,7 +641,7 @@ class Record3dFrame:
 
 
         # ========= Background =========
-        bg_indices =  ~joint_mask#  & (~joint_mask)conf_mask &
+        bg_indices = conf_mask & (depth > 0) & ~joint_mask
         bg_homo_grid = np.pad(grid[bg_indices], ((0, 0), (0, 1)), constant_values=1)
         local_dirs_bg = np.einsum("ij,bj->bi", np.linalg.inv(K), bg_homo_grid)
         dirs_bg = np.einsum("ij,bj->bi", rotation, local_dirs_bg)
@@ -625,11 +652,20 @@ class Record3dFrame:
 
         H, W = depth.shape
         points_bg_map = np.zeros((H, W, 3), dtype=np.float32)
+        points_bg_map_nksr = np.zeros((H, W, 3), dtype=np.float32)
 
         # 2.  Scatter the background points into the map
         # ── Case A: bg_indices has shape (H, W) ────────────────────────────────
         if bg_indices.ndim == 2:               
             points_bg_map[bg_indices] = points_bg      # points_bg is N×3
+
+        nksr_bg_indices = conf_mask & np.isfinite(depth) & (depth > 0) & (~mask) & (~obj_mask)
+        if np.any(nksr_bg_indices):
+            nksr_bg_homo_grid = np.pad(grid[nksr_bg_indices], ((0, 0), (0, 1)), constant_values=1)
+            nksr_local_dirs_bg = np.einsum("ij,bj->bi", np.linalg.inv(K), nksr_bg_homo_grid)
+            nksr_dirs_bg = np.einsum("ij,bj->bi", rotation, nksr_local_dirs_bg)
+            nksr_points_bg = translation + nksr_dirs_bg * depth[nksr_bg_indices, None]
+            points_bg_map_nksr[nksr_bg_indices] = nksr_points_bg.astype(np.float32)
             
 
         if bg_downsample_factor > 1 and points_bg.shape[0] > 0:
@@ -643,7 +679,7 @@ class Record3dFrame:
         depth[joint_mask] = 0.0
         normals[joint_mask] =0.0
 
-        return [points_fg, point_colors_fg, points_bg, point_colors_bg, points_all, point_colors_all, points_obj, point_colors_obj], normals, [depth, rotation, translation, K, points_bg_map]
+        return [points_fg, point_colors_fg, points_bg, point_colors_bg, points_all, point_colors_all, points_obj, point_colors_obj], normals, [depth, rotation, translation, K, points_bg_map, points_bg_map_nksr]
 
 
     def get_filtered_point_cloud(
@@ -680,6 +716,7 @@ class Record3dFrame:
             skimage.transform.resize(self.obj_mask, rgb.shape[:2], order=0),
         )
         mask = dilation(mask, disk(11))
+        obj_mask = dilation(obj_mask, disk(11))
     
   
         assert depth.shape == rgb.shape[:2]
@@ -772,7 +809,7 @@ class Record3dFrame:
         mean_plus_3std = np.quantile(depth, 0.99)
         mask4 = depth >= mean_plus_3std
 
-        joint_mask = mask1 | mask2  | mask4 # | dissimilar_normals_mask #| mask3 #|  dissimilar_normals_mask
+        joint_mask = mask1 | obj_mask | mask2 | mask4 # | dissimilar_normals_mask #| mask3 #|  dissimilar_normals_mask
         ## this is the element to ignore
 
 
@@ -839,6 +876,7 @@ class Record3dFrame:
             skimage.transform.resize(self.obj_mask, rgb.shape[:2], order=0),
         )
         mask = dilation(mask, disk(11))
+        obj_mask = dilation(obj_mask, disk(11))
 
         assert depth.shape == rgb.shape[:2]
 
@@ -921,7 +959,7 @@ class Record3dFrame:
         mask3 = depth > 5.0
         mean_plus_3std = np.quantile(depth, 0.95)
         mask4 = depth > mean_plus_3std
-        joint_mask = mask1 | mask2 #| mask3
+        joint_mask = mask1 | obj_mask | mask2 #| mask3
         bg_indices = conf_mask & ~joint_mask & ~reprojected_mask
         bg_homo_grid = np.pad(grid[bg_indices], ((0, 0), (0, 1)), constant_values=1)
         local_dirs_bg = np.einsum("ij,bj->bi", np.linalg.inv(K), bg_homo_grid)
@@ -992,6 +1030,7 @@ class Record3dFrame:
             skimage.transform.resize(self.obj_mask, rgb.shape[:2], order=0),
         )
         mask = dilation(mask, disk(11))
+        obj_mask = dilation(obj_mask, disk(11))
 
         assert depth.shape == rgb.shape[:2]
 
@@ -1066,7 +1105,7 @@ class Record3dFrame:
         mask3 = depth > 5.0
         mean_plus_3std = np.quantile(depth, 0.95)
         mask4 = depth > mean_plus_3std
-        joint_mask = mask1 | mask2 #| mask3
+        joint_mask = mask1 | obj_mask | mask2 #| mask3
         bg_indices = conf_mask & ~joint_mask & ~reprojected_mask
         bg_homo_grid = np.pad(grid[bg_indices], ((0, 0), (0, 1)), constant_values=1)
         local_dirs_bg = np.einsum("ij,bj->bi", np.linalg.inv(K), bg_homo_grid)
@@ -1335,6 +1374,12 @@ class Record3dFrame:
             np.ndarray,
             skimage.transform.resize(self.mask, rgb.shape[:2], order=0),
         )
+        obj_mask = cast(
+            np.ndarray,
+            skimage.transform.resize(self.obj_mask, rgb.shape[:2], order=0),
+        )
+        mask = dilation(mask, disk(11))
+        obj_mask = dilation(obj_mask, disk(11))
         assert depth.shape == rgb.shape[:2]
 
         K = self.K
@@ -1839,7 +1884,7 @@ class Record3dFrame:
         # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
         #edge_mask = cv2.dilate(edge_mask.astype(np.uint8), kernel, iterations=1).astype(bool)
         # edge_mask = np.ones_like(edge_mask)
-        bg_indices = edge_mask # np.ones_like(conf_mask & (~mask))
+        bg_indices = edge_mask & (~mask) & (~obj_mask)
 
         H, W = depth.shape
         points_bg_map = np.zeros((H, W, 3), dtype=np.float32)

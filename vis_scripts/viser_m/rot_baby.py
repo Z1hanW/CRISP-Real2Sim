@@ -141,6 +141,33 @@ def get_calibration_roll_pitch(image: np.ndarray, device: str) -> Tuple[float, f
     from geocalib.utils import print_calibration
 
     model = GeoCalib().to(device)
+    # GeoCalib can fail while estimating uncertainty even after roll/pitch
+    # optimization succeeds, usually from a singular Hessian on low-texture
+    # frames. The downstream postprocess only needs gravity.rp, so keep the
+    # optimized gravity and zero the uncertainty fields in that failure mode.
+    optimizer = getattr(getattr(model, "model", None), "optimizer", None)
+    if optimizer is not None and hasattr(optimizer, "estimate_uncertainty"):
+        estimate_uncertainty_orig = optimizer.estimate_uncertainty
+
+        def estimate_uncertainty_safe(camera_opt, gravity_opt, errors, weights):
+            try:
+                return estimate_uncertainty_orig(camera_opt, gravity_opt, errors, weights)
+            except RuntimeError as exc:
+                print(f"[WARN] GeoCalib uncertainty failed; using zero uncertainty: {exc}")
+                rp = gravity_opt.rp
+                batch = int(rp.shape[0]) if rp.ndim > 1 else 1
+                zero = rp.new_zeros(batch)
+                return {
+                    "covariance": rp.new_zeros(batch, 3, 3),
+                    "roll_uncertainty": zero,
+                    "pitch_uncertainty": zero,
+                    "gravity_uncertainty": zero,
+                    "focal_uncertainty": zero,
+                    "vfov_uncertainty": zero,
+                }
+
+        optimizer.estimate_uncertainty = estimate_uncertainty_safe
+
     input_image = torch.tensor(image, dtype=torch.float32).to(device).permute(2, 0, 1)
     result = model.calibrate(input_image)
 
@@ -998,9 +1025,6 @@ def process_sequence(
     seq_output_root.mkdir(parents=True, exist_ok=True)
     vis_dir = seq_output_root / "saved_obj"
 
-    if camera_npz is not None:
-        print("[WARN] Ignoring --camera-npz; using default *_sgd_cvd_hr camera export.")
-
     # 1) rotation
     cached_world_rotation = seq_output_root / "world_rotation.npy"
     if cached_world_rotation.exists():
@@ -1013,7 +1037,7 @@ def process_sequence(
             scene_name=seq_name,
             hmr_type=hmr_type,
             repo_root=repo_root,
-            camera_npz=None,
+            camera_npz=camera_npz,
             data_root=data_root,
             is_megasam=is_megasam,
         )
@@ -1213,7 +1237,15 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     parser.add_argument("--hmr-type", default="gv", help="Name of the HMR subfolder to use.")
     parser.add_argument("--input-root", type=Path, default=DEFAULT_INPUT_ROOT, help="Root containing raw scene outputs.")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Where to save rotated+shifted outputs.")
-    parser.add_argument("--camera-npz", type=Path, default=None, help="Optional explicit camera NPZ (ignored by default pipeline).")
+    parser.add_argument("--camera-npz", type=Path, default=None, help="Optional explicit camera NPZ/NPY used for world alignment.")
+    parser.add_argument(
+        "--camera-npz-template",
+        default=None,
+        help=(
+            "Optional per-sequence camera NPZ template. Supports {seq}, {seq_name}, and {hmr_type}, "
+            "for example results/output/scene/{seq}_vggt_omega_{hmr_type}_sgd_cvd_hr.npz."
+        ),
+    )
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT, help="Dataset root used to locate reference images.")
     parser.add_argument("--no-megasam", action="store_true", help="Disable MegaSAM-specific image normalization.")
     parser.add_argument("--debug-stride", type=int, default=10, help="Stride for dumping visualization OBJ meshes.")
@@ -1306,12 +1338,18 @@ def main(argv: Optional[Sequence[str]] = None):
     extra_read_ours_opt = not args.no_extra_read_ours_opt
 
     for seq_name in seq_names:
+        seq_camera_npz = camera_npz
+        if args.camera_npz_template:
+            rendered = args.camera_npz_template.format(seq=seq_name, seq_name=seq_name, hmr_type=args.hmr_type)
+            seq_camera_npz = Path(rendered)
+            if not seq_camera_npz.is_absolute():
+                seq_camera_npz = repo_root / seq_camera_npz
         process_sequence(
             seq_name=seq_name,
             input_root=input_root,
             output_root=output_root,
             hmr_type=args.hmr_type,
-            camera_npz=camera_npz,
+            camera_npz=seq_camera_npz,
             data_root=data_root,
             is_megasam=is_megasam,
             export_motion_root=export_motion_root,

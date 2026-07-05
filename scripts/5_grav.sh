@@ -6,9 +6,13 @@ cd ../prep/HMR
 VIDEO_DIR="${1}_videos"
 
 
-# Get total number of GPUs available
-GPU_COUNT=$(nvidia-smi -L | wc -l)
-GPU_IDS=($(seq 0 $((GPU_COUNT - 1))))
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    IFS=',' read -r -a GPU_IDS <<< "$CUDA_VISIBLE_DEVICES"
+else
+    GPU_COUNT=$(nvidia-smi -L | wc -l)
+    GPU_IDS=($(seq 0 $((GPU_COUNT - 1))))
+fi
+GPU_COUNT=${#GPU_IDS[@]}
 
 # Find all *.mp4 files in the directory
 VIDEO_FILES=($(find "$VIDEO_DIR" -maxdepth 1 -name "*.mp4"))

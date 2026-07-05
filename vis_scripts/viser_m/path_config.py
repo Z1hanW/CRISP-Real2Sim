@@ -30,7 +30,7 @@ AGENT_OUTPUT_DIR = RESULTS_OUTPUT_DIR / "agent"
 
 # VSLAM-related data
 VSLAM_ROOT = RESULTS_INIT_DIR / "vslam"
-VSLAM_MEGACAM_DIR = VSLAM_ROOT / "megacam"
+VSLAM_MEGACAM_DIR = Path(os.getenv("VSLAM_MEGACAM_DIR", VSLAM_ROOT / "megacam"))
 VSLAM_PRIORS_DIR = VSLAM_ROOT / "raw_mega_priors"
 
 # Contacts and auxiliary annotations

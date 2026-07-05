@@ -14,6 +14,7 @@ from pathlib import Path
 from collections import defaultdict
 import re
 import json
+import os
 
 import open3d as o3d
 import numpy as np
@@ -63,6 +64,13 @@ from copy import copy
 from typing import Dict, List
 
 _PRIM_KEYS = ["S_items", "R_items", "T_items", "pts_items"]
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 from pytorch3d.utils import ico_sphere
@@ -459,14 +467,38 @@ def filter_bg_points_by_human_distance(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     """
-    tree = cKDTree(human_transl_np)
-    distances, _ = tree.query(bg_position, k=1)          # nearest-neighbour distance
-    mask = distances <= max_dist
-    depth[~mask] = 0
-    if real_normal is None: 
-      return bg_position[mask], bg_color[mask], depth# , real_normal[mask]
-    else:
-      return bg_position[mask], bg_color[mask], depth, real_normal[mask]
+    bg_position = np.asarray(bg_position, dtype=np.float32)
+    bg_color = np.asarray(bg_color)
+    human_transl_np = np.asarray(human_transl_np, dtype=np.float32)
+
+    if human_transl_np.ndim != 2 or human_transl_np.shape[1] != 3:
+        raise ValueError(f"Expected human_transl_np with shape [T, 3], got {human_transl_np.shape}")
+
+    flat_points = bg_position.reshape(-1, 3)
+    flat_colors = bg_color.reshape(-1, bg_color.shape[-1]) if bg_color.ndim >= 2 else np.asarray(bg_color).reshape(-1, 1)
+    valid_points = np.isfinite(flat_points).all(axis=1) & (np.linalg.norm(flat_points, axis=1) > 1e-8)
+
+    keep_flat = np.zeros((flat_points.shape[0],), dtype=bool)
+    if np.any(valid_points):
+        tree = cKDTree(human_transl_np)
+        distances, _ = tree.query(flat_points[valid_points], k=1)
+        keep_valid = distances <= max_dist
+        keep_flat[np.where(valid_points)[0][keep_valid]] = True
+
+    if depth is not None and bg_position.ndim == 3 and depth.shape[:2] == bg_position.shape[:2]:
+        keep_mask_hw = keep_flat.reshape(bg_position.shape[:2])
+        depth[~keep_mask_hw] = 0
+
+    points_kept = flat_points[keep_flat]
+    colors_kept = flat_colors[keep_flat]
+
+    if real_normal is None:
+        return points_kept, colors_kept, depth
+
+    normals = np.asarray(real_normal, dtype=np.float32)
+    flat_normals = normals.reshape(-1, 3)
+    normals_kept = flat_normals[keep_flat]
+    return points_kept, colors_kept, depth, normals_kept
 
 def cluster_normals(
     normals: torch.Tensor,
@@ -1594,17 +1626,25 @@ def compute_segment_properties(
         y_idx_t = torch.tensor(y_idx, device=device, dtype=torch.long)
         x_idx_t = torch.tensor(x_idx, device=device, dtype=torch.long)
         
-        # Get normals for this segment (already in world space)
-        seg_normals = normals[y_idx_t, x_idx_t]
-        avg_normal = F.normalize(seg_normals.mean(dim=0), dim=0)
-        
         d = depth[y_idx_t, x_idx_t]
-        valid = d > 0
+        pts_all = pointclouds[y_idx_t, x_idx_t]
+        seg_normals_all = normals[y_idx_t, x_idx_t]
+        valid = (
+            (d > 0)
+            & torch.isfinite(pts_all).all(dim=-1)
+            & torch.isfinite(seg_normals_all).all(dim=-1)
+            & (torch.linalg.norm(pts_all, dim=-1) > 1.0e-8)
+            & (torch.linalg.norm(seg_normals_all, dim=-1) > 1.0e-6)
+        )
         
         if valid.sum() < 10:
             continue
         
-        pts_world = pointclouds[y_idx_t, x_idx_t]
+        # Get normals for this segment (already in world space)
+        seg_normals = seg_normals_all[valid]
+        avg_normal = _oriented_mean_normal(seg_normals)
+
+        pts_world = pts_all[valid]
         centroid = pts_world.mean(dim=0)
         
         # Find boundary pixels
@@ -2103,12 +2143,17 @@ def robust_plane_ransac(P, n_hint=None, n_iters=500, thresh=0.02):
     best_n = None
     best_c = None
     N = P.shape[0]
+    try:
+        rng = torch.Generator(device=P.device)
+        rng.manual_seed(1729 + int(N))
+    except Exception:
+        rng = None
     for _ in range(n_iters):
         # try until we sample a non-degenerate triplet
         for _ in range(10):
-            idx = torch.randint(0, N, (3,), device=P.device)
+            idx = torch.randint(0, N, (3,), device=P.device, generator=rng)
             v1, v2, v3 = P[idx]
-            n = torch.cross(v2-v1, v3-v1)
+            n = torch.linalg.cross(v2-v1, v3-v1)
             if torch.linalg.norm(n) > 1e-6:
                 n = F.normalize(n, dim=0)
                 break
@@ -2358,8 +2403,53 @@ def extent(u: torch.Tensor):
     q = torch.quantile(u, torch.tensor([0.00, 0.99], device=u.device, dtype=u.dtype))
     return (q[1] - q[0]) / 2, (q[1] + q[0]) / 2
 
-def fit_one_plane_box(P: torch.Tensor, n: torch.Tensor, c: torch.Tensor, gid):
+def _oriented_mean_normal(normals: torch.Tensor) -> torch.Tensor:
+    normals = normals[torch.isfinite(normals).all(dim=-1)]
+    if normals.numel() == 0:
+        return torch.tensor([0.0, 0.0, 1.0], device=normals.device, dtype=normals.dtype)
+    normals = F.normalize(normals, dim=-1)
+    ref = normals[0]
+    signs = torch.where((normals @ ref) < 0.0, -1.0, 1.0).to(device=normals.device, dtype=normals.dtype)
+    mean = (normals * signs.unsqueeze(-1)).mean(dim=0)
+    if not torch.isfinite(mean).all() or torch.linalg.norm(mean) < 1.0e-6:
+        return ref
+    return F.normalize(mean, dim=0)
+
+def _fit_plane_box_for_axis(P: torch.Tensor, n: torch.Tensor, c: torch.Tensor, x_axis: torch.Tensor):
+    """Fit a plane box using a fixed in-plane x axis."""
+    n = F.normalize(n, dim=0)
+    x_axis = x_axis - (x_axis @ n) * n
+    if torch.linalg.norm(x_axis) < 1.0e-6:
+        raise ValueError("Axis hint is parallel to plane normal.")
+    x_axis = F.normalize(x_axis, dim=0)
+    y_axis = F.normalize(torch.linalg.cross(n, x_axis), dim=0)
+
+    P0 = P - c
+    Pp = P0 - (P0 @ n).unsqueeze(1) * n
+    u_proj = Pp @ x_axis
+    v_proj = Pp @ y_axis
+    u_half, u_mid = extent(u_proj)
+    v_half, v_mid = extent(v_proj)
+
+    signed_dist_n = P0 @ n
+    n_mid = torch.quantile(signed_dist_n, torch.tensor(0.50, device=P.device, dtype=P.dtype))
+    dist_n = (signed_dist_n - n_mid).abs()
+    z_half = torch.quantile(dist_n, torch.tensor(0.95, device=P.device, dtype=P.dtype)).clamp(min=0.02)
+
+    centre = c + u_mid * x_axis + v_mid * y_axis + n_mid * n
+    half_sz = torch.stack([u_half, v_half, z_half]).clamp(min=0.02)
+    R_bw = torch.stack([x_axis, y_axis, n], dim=1)
+    if torch.det(R_bw) < 0:
+        R_bw[:, 0] = -R_bw[:, 0]
+    return R_bw, centre, half_sz
+
+
+def fit_one_plane_box(P: torch.Tensor, n: torch.Tensor, c: torch.Tensor, gid, axis_hint: torch.Tensor | None = None):
     """Fit a single plane-aligned box to points P given plane (n,c). Returns (R_bw, centre, half_sz, rect_ratio)."""
+    P = P[torch.isfinite(P).all(dim=1)]
+    if P.shape[0] < 3:
+        raise ValueError(f"[{gid}] Need at least 3 finite points for plane box fitting.")
+    n = F.normalize(n, dim=0)
     P0 = P - c
     Pp = P0 - (P0 @ n).unsqueeze(1) * n
 
@@ -2386,22 +2476,289 @@ def fit_one_plane_box(P: torch.Tensor, n: torch.Tensor, c: torch.Tensor, gid):
     cth = torch.cos(theta).to(device=device); sth = torch.sin(theta).to(device=device)
     x_axis = (UV.to(device) @ torch.stack([cth, sth]).to(dtype=P.dtype, device=device))
     x_axis = F.normalize(x_axis - (x_axis @ n) * n, dim=0)
-    y_axis = F.normalize(torch.linalg.cross(n, x_axis), dim=0)
+    R_bw, centre, half_sz = _fit_plane_box_for_axis(P, n, c, x_axis)
 
-    # Extents from quantiles in those axes (robust to outliers)
-    u_proj = (Pp @ x_axis); v_proj = (Pp @ y_axis)
-    u_half, u_mid = extent(u_proj)
-    v_half, v_mid = extent(v_proj)
-
-    # Thickness from normal distances
-    dist_n = (P0 @ n).abs()
-    z_half = torch.quantile(dist_n, torch.tensor(0.95, device=device, dtype=P.dtype)).clamp(min=0.02)
-
-    centre  = c + u_mid * x_axis + v_mid * y_axis
-    half_sz = torch.stack([u_half, v_half, z_half]).clamp(min=0.02)
-    R_bw = torch.stack([x_axis, y_axis, n], dim=1)
-    if torch.det(R_bw) < 0: R_bw[:, 0] = -R_bw[:, 0]
+    if axis_hint is not None:
+        try:
+            hint = axis_hint.to(device=device, dtype=P.dtype)
+            hint = hint - (hint @ n) * n
+            if torch.linalg.norm(hint) > 1.0e-6:
+                hint = F.normalize(hint, dim=0)
+                R_hint, centre_hint, half_hint = _fit_plane_box_for_axis(P, n, c, hint)
+                base_support, base_area = _plane_box_support_score(P, R_bw, centre, half_sz, grid_base=56)
+                hint_support, hint_area = _plane_box_support_score(P, R_hint, centre_hint, half_hint, grid_base=56)
+                base_axis = R_bw[:, 0]
+                delta = float(
+                    torch.rad2deg(
+                        torch.atan2(
+                            torch.dot(hint, R_bw[:, 1]),
+                            torch.dot(hint, base_axis),
+                        )
+                    ).detach().cpu().item()
+                )
+                delta = ((delta + 45.0) % 90.0) - 45.0
+                tradeoff_allowed = (
+                    hint_area <= base_area
+                    or base_area >= 5.0
+                )
+                snap_ok = (
+                    tradeoff_allowed
+                    and
+                    hint_area <= base_area * 1.35
+                    and hint_support >= base_support - 0.25
+                    and abs(delta) >= 2.0
+                )
+                if snap_ok:
+                    print(
+                        f"[{gid}] Axis snap {delta:+.1f}deg "
+                        f"support {base_support:.2f}->{hint_support:.2f} "
+                        f"area {base_area:.2f}->{hint_area:.2f}"
+                    )
+                    R_bw, centre, half_sz = R_hint, centre_hint, half_hint
+        except Exception:
+            pass
     return R_bw, centre, half_sz, rect_ratio
+
+def _plane_box_support_score(
+    P: torch.Tensor,
+    R_bw: torch.Tensor,
+    centre: torch.Tensor,
+    half_sz: torch.Tensor,
+    grid_base: int = 14,
+) -> Tuple[float, float]:
+    """Return support ratio and in-plane area for the fitted watertight box."""
+    if P.shape[0] == 0:
+        return 0.0, 0.0
+    local = (P - centre) @ R_bw
+    half_xy = half_sz[:2].clamp(min=1.0e-4)
+    in_xy = (local[:, 0].abs() <= half_xy[0]) & (local[:, 1].abs() <= half_xy[1])
+    if not bool(in_xy.any()):
+        return 0.0, float((4.0 * half_xy[0] * half_xy[1]).detach().cpu().item())
+
+    xy = local[in_xy, :2]
+    aspect = float((half_xy[0] / half_xy[1]).clamp(0.25, 4.0).detach().cpu().item())
+    nx = int(np.clip(round(grid_base * np.sqrt(aspect)), 5, 28))
+    ny = int(np.clip(round(grid_base / np.sqrt(aspect)), 5, 28))
+    uv = ((xy + half_xy) / (2.0 * half_xy)).clamp(0.0, 0.999999)
+    ix = torch.clamp((uv[:, 0] * nx).long(), 0, nx - 1)
+    iy = torch.clamp((uv[:, 1] * ny).long(), 0, ny - 1)
+    occupied = torch.unique(iy * nx + ix).numel()
+    support = float(occupied) / float(nx * ny)
+    area = float((4.0 * half_xy[0] * half_xy[1]).detach().cpu().item())
+    return support, area
+
+
+def _edge_aware_trim_plane_box(
+    P: torch.Tensor,
+    R_bw: torch.Tensor,
+    centre: torch.Tensor,
+    half_sz: torch.Tensor,
+    gid,
+    *,
+    grid_base: int = 36,
+    min_edge_fill: float = 0.20,
+    min_keep_fraction: float = 0.88,
+    min_area_reduction: float = 0.06,
+    min_support_gain: float = 0.03,
+    edge_padding: float = 0.02,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """
+    Shrink a fitted plane box to occupied footprint edges.
+
+    This prevents a few edge/outlier points from making the watertight primitive
+    protrude beyond the observed surface. The trim is conservative: it is accepted
+    only when it keeps most points and either removes meaningful area or improves
+    the support-grid score.
+    """
+    if P.shape[0] < 3:
+        return R_bw, centre, half_sz, False
+
+    half_xy = half_sz[:2].clamp(min=1.0e-4)
+    if float(torch.min(half_xy).detach().cpu().item()) <= 1.0e-5:
+        return R_bw, centre, half_sz, False
+
+    local = (P - centre.unsqueeze(0)) @ R_bw
+    in_rect = (
+        (local[:, 0].abs() <= half_xy[0])
+        & (local[:, 1].abs() <= half_xy[1])
+    )
+    if int(in_rect.sum().item()) < 20:
+        return R_bw, centre, half_sz, False
+
+    xy = local[in_rect, :2]
+    aspect = float((half_xy[0] / half_xy[1]).clamp(0.20, 5.0).detach().cpu().item())
+    nx = int(np.clip(round(grid_base * np.sqrt(aspect)), 8, 80))
+    ny = int(np.clip(round(grid_base / np.sqrt(aspect)), 8, 80))
+    uv = ((xy + half_xy) / (2.0 * half_xy)).clamp(0.0, 0.999999)
+    ix = torch.clamp((uv[:, 0] * nx).long(), 0, nx - 1)
+    iy = torch.clamp((uv[:, 1] * ny).long(), 0, ny - 1)
+
+    counts = torch.zeros((ny, nx), device=P.device, dtype=torch.int32)
+    counts.index_put_((iy, ix), torch.ones_like(ix, dtype=torch.int32), accumulate=True)
+    occupied = counts > 0
+    if int(occupied.sum().item()) < 4:
+        return R_bw, centre, half_sz, False
+
+    x0, x1 = 0, nx - 1
+    y0, y1 = 0, ny - 1
+    min_cols = min(4, nx)
+    min_rows = min(4, ny)
+
+    def _edge_fill(axis: str) -> float:
+        if axis == "left":
+            edge = occupied[y0 : y1 + 1, x0]
+        elif axis == "right":
+            edge = occupied[y0 : y1 + 1, x1]
+        elif axis == "bottom":
+            edge = occupied[y0, x0 : x1 + 1]
+        else:
+            edge = occupied[y1, x0 : x1 + 1]
+        if edge.numel() == 0:
+            return 0.0
+        return float(edge.float().mean().detach().cpu().item())
+
+    changed = True
+    while changed and (x1 - x0 + 1) >= min_cols and (y1 - y0 + 1) >= min_rows:
+        changed = False
+        if (x1 - x0 + 1) > min_cols and _edge_fill("left") < min_edge_fill:
+            x0 += 1
+            changed = True
+        if (x1 - x0 + 1) > min_cols and _edge_fill("right") < min_edge_fill:
+            x1 -= 1
+            changed = True
+        if (y1 - y0 + 1) > min_rows and _edge_fill("bottom") < min_edge_fill:
+            y0 += 1
+            changed = True
+        if (y1 - y0 + 1) > min_rows and _edge_fill("top") < min_edge_fill:
+            y1 -= 1
+            changed = True
+
+    if x0 == 0 and x1 == nx - 1 and y0 == 0 and y1 == ny - 1:
+        return R_bw, centre, half_sz, False
+
+    cell_w = (2.0 * half_xy[0]) / float(nx)
+    cell_h = (2.0 * half_xy[1]) / float(ny)
+    pad_x = min(float(edge_padding), float((0.5 * cell_w).detach().cpu().item()))
+    pad_y = min(float(edge_padding), float((0.5 * cell_h).detach().cpu().item()))
+
+    lo_x = -half_xy[0] + cell_w * float(x0)
+    hi_x = -half_xy[0] + cell_w * float(x1 + 1)
+    lo_y = -half_xy[1] + cell_h * float(y0)
+    hi_y = -half_xy[1] + cell_h * float(y1 + 1)
+    lo_x = torch.maximum(lo_x - pad_x, -half_xy[0])
+    hi_x = torch.minimum(hi_x + pad_x, half_xy[0])
+    lo_y = torch.maximum(lo_y - pad_y, -half_xy[1])
+    hi_y = torch.minimum(hi_y + pad_y, half_xy[1])
+
+    new_half_x = 0.5 * (hi_x - lo_x)
+    new_half_y = 0.5 * (hi_y - lo_y)
+    if float(torch.minimum(new_half_x, new_half_y).detach().cpu().item()) <= 0.015:
+        return R_bw, centre, half_sz, False
+
+    keep = (
+        (local[:, 0] >= lo_x)
+        & (local[:, 0] <= hi_x)
+        & (local[:, 1] >= lo_y)
+        & (local[:, 1] <= hi_y)
+    )
+    keep_fraction = float(keep.float().mean().detach().cpu().item())
+    if keep_fraction < min_keep_fraction:
+        return R_bw, centre, half_sz, False
+
+    center_delta = torch.stack([0.5 * (lo_x + hi_x), 0.5 * (lo_y + hi_y), torch.zeros((), device=P.device, dtype=P.dtype)])
+    new_centre = centre + R_bw @ center_delta
+    new_half_sz = half_sz.clone()
+    new_half_sz[0] = new_half_x
+    new_half_sz[1] = new_half_y
+    new_half_sz = new_half_sz.clamp(min=0.02)
+
+    old_support, old_area = _plane_box_support_score(P, R_bw, centre, half_sz)
+    new_support, new_area = _plane_box_support_score(P, R_bw, new_centre, new_half_sz)
+    if old_area <= 1.0e-8:
+        return R_bw, centre, half_sz, False
+    area_reduction = 1.0 - (new_area / old_area)
+    support_gain = new_support - old_support
+    if area_reduction < min_area_reduction and support_gain < min_support_gain:
+        return R_bw, centre, half_sz, False
+
+    print(
+        f"[{gid}] Edge trim area -{area_reduction * 100:.1f}% "
+        f"support {old_support:.2f}->{new_support:.2f} keep={keep_fraction:.2f}"
+    )
+    return R_bw, new_centre, new_half_sz, True
+
+
+def _fit_supported_plane_box(
+    P: torch.Tensor,
+    n: torch.Tensor,
+    c: torch.Tensor,
+    gid,
+    axis_hint: torch.Tensor | None = None,
+    edge_trim: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float, float]:
+    R_bw, centre, half_sz, rect_ratio = fit_one_plane_box(P, n, c, gid, axis_hint=axis_hint)
+    if edge_trim:
+        R_bw, centre, half_sz, _ = _edge_aware_trim_plane_box(P, R_bw, centre, half_sz, gid)
+    support_ratio, area = _plane_box_support_score(P, R_bw, centre, half_sz)
+    return R_bw, centre, half_sz, rect_ratio, support_ratio, area
+
+
+def _largest_gap_cut(local_xy: torch.Tensor, min_gap_ratio: float = 0.12) -> Tuple[int, torch.Tensor, float] | None:
+    best: Tuple[int, torch.Tensor, float] | None = None
+    for axis in (0, 1):
+        coord = local_xy[:, axis]
+        if coord.numel() < 2:
+            continue
+        lo = torch.quantile(coord, torch.tensor(0.01, device=coord.device, dtype=coord.dtype))
+        hi = torch.quantile(coord, torch.tensor(0.99, device=coord.device, dtype=coord.dtype))
+        span = hi - lo
+        if float(span.detach().cpu().item()) <= 1.0e-6:
+            continue
+        clipped = coord[(coord >= lo) & (coord <= hi)]
+        if clipped.numel() < 2:
+            continue
+        sorted_coord = torch.sort(clipped).values
+        gaps = sorted_coord[1:] - sorted_coord[:-1]
+        if gaps.numel() > 0:
+            gap_idx = int(torch.argmax(gaps).item())
+            gap = gaps[gap_idx]
+            gap_ratio = float((gap / span).detach().cpu().item())
+            if gap_ratio >= min_gap_ratio:
+                cut = 0.5 * (sorted_coord[gap_idx] + sorted_coord[gap_idx + 1])
+                if best is None or gap_ratio > best[2]:
+                    best = (axis, cut, gap_ratio)
+    return best
+
+
+def _candidate_cut_values(local_xy: torch.Tensor, min_gap_ratio: float = 0.12) -> List[Tuple[int, torch.Tensor]]:
+    cuts: List[Tuple[int, torch.Tensor]] = []
+    gap_cut = _largest_gap_cut(local_xy, min_gap_ratio=min_gap_ratio)
+    if gap_cut is not None:
+        cuts.append((gap_cut[0], gap_cut[1]))
+
+    for axis in (0, 1):
+        coord = local_xy[:, axis]
+        if coord.numel() < 2:
+            continue
+        quantiles = torch.tensor(
+            [0.25, 0.33, 0.50, 0.67, 0.75],
+            device=coord.device,
+            dtype=coord.dtype,
+        )
+        values = torch.quantile(coord, quantiles)
+        axis_cuts: List[torch.Tensor] = []
+        for value in values:
+            if not torch.isfinite(value):
+                continue
+            duplicate = any(
+                bool(torch.isclose(value, prev, rtol=1.0e-4, atol=1.0e-4).detach().cpu().item())
+                for prev in axis_cuts
+            )
+            if not duplicate:
+                axis_cuts.append(value)
+        cuts.extend((axis, value) for value in axis_cuts)
+    return cuts
+
 
 def split_plane_clusters(P: torch.Tensor, n: torch.Tensor, c: torch.Tensor, gid,
                           tau: float = 0.70, max_splits: int = 3, min_pts: int = 150):
@@ -2420,9 +2777,9 @@ def split_plane_clusters(P: torch.Tensor, n: torch.Tensor, c: torch.Tensor, gid,
     # clusters start with all points
     clusters = [torch.arange(P.shape[0], device=P.device)]
     attempts = 0
-    while attempts < max_splits and len(clusters) > 0:
+    while len(clusters) > 0:
         idx = clusters.pop(0)
-        if idx.numel() < min_pts:
+        if idx.numel() < min_pts or attempts >= max_splits:
             R_bw, centre, half_sz, _ = fit_one_plane_box(P[idx], n, c, gid)
             out.append((R_bw, centre, half_sz))
             continue
@@ -2451,6 +2808,411 @@ def split_plane_clusters(P: torch.Tensor, n: torch.Tensor, c: torch.Tensor, gid,
                 clusters.append(right)
                 attempts += 1
     return out
+
+
+def fit_support_aware_plane_boxes(
+    P: torch.Tensor,
+    n: torch.Tensor,
+    c: torch.Tensor,
+    gid,
+    *,
+    max_depth: int = 2,
+    min_pts: int = 180,
+    min_support: float = 0.48,
+    min_improvement: float = 0.12,
+    large_area_split: float = 8.0,
+    fine_support_split: float = 0.96,
+    min_area_reduction: float = 0.045,
+    axis_hint: torch.Tensor | None = None,
+) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]]:
+    """
+    Fit a small set of watertight boxes whose visible top footprint is supported by points.
+
+    The first candidate is a plane-aligned box. If its in-plane support grid is too sparse,
+    recursively split along the strongest empty gap or median cut. A split is accepted only
+    when it reduces unsupported area enough, which keeps primitive counts compact.
+    """
+    P = P[torch.isfinite(P).all(dim=1)]
+    if P.shape[0] < 3:
+        return []
+    n = F.normalize(n, dim=0)
+
+    def _fit_leaf(points: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float, float]:
+        return _fit_supported_plane_box(points, n, c, gid, axis_hint=axis_hint)
+
+    def _waste(score: float, area: float) -> float:
+        return float(area) * max(0.0, 1.0 - float(score))
+
+    def _recurse(points: torch.Tensor, depth: int) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]]:
+        R_bw, centre, half_sz, rect_ratio, support, area = _fit_leaf(points)
+        current_waste = _waste(support, area)
+        local = (points - centre) @ R_bw
+        gap_cut = _largest_gap_cut(local[:, :2], min_gap_ratio=0.12)
+        fine_support, _ = _plane_box_support_score(points, R_bw, centre, half_sz, grid_base=56)
+        large_envelope = area >= large_area_split and fine_support <= fine_support_split
+        if (
+            (support >= min_support and gap_cut is None and not large_envelope)
+            or depth >= max_depth
+            or points.shape[0] < 2 * min_pts
+            or area <= 1.0e-6
+        ):
+            return [(R_bw, centre, half_sz, points.detach().cpu(), support)]
+
+        best = None
+        for axis, cut_value in _candidate_cut_values(local[:, :2]):
+            left_mask = local[:, axis] <= cut_value
+            right_mask = ~left_mask
+            left_count = int(left_mask.sum().item())
+            right_count = int(right_mask.sum().item())
+            if left_count < min_pts or right_count < min_pts:
+                continue
+            left = points[left_mask]
+            right = points[right_mask]
+            try:
+                _, _, _, _, score_l, area_l = _fit_leaf(left)
+                _, _, _, _, score_r, area_r = _fit_leaf(right)
+            except Exception:
+                continue
+            split_area = area_l + area_r
+            split_waste = _waste(score_l, area_l) + _waste(score_r, area_r)
+            area_reduction = 1.0 - (split_area / max(area, 1.0e-8))
+            best_key = split_waste - max(area_reduction, 0.0) * 0.25 * area
+            if best is None or best_key < best[0]:
+                best = (
+                    best_key,
+                    split_waste,
+                    split_area,
+                    area_reduction,
+                    left,
+                    right,
+                    axis,
+                    float(cut_value.detach().cpu().item()),
+                    score_l,
+                    score_r,
+                )
+
+        if best is None:
+            return [(R_bw, centre, half_sz, points.detach().cpu(), support)]
+
+        _, split_waste, split_area, area_reduction, left, right, axis, cut_value, score_l, score_r = best
+        support_improved = split_waste <= current_waste * (1.0 - min_improvement)
+        envelope_improved = large_envelope and area_reduction >= min_area_reduction and min(score_l, score_r) >= min_support
+        if not support_improved and not envelope_improved:
+            return [(R_bw, centre, half_sz, points.detach().cpu(), support)]
+
+        split_reason = "support" if support_improved else "envelope"
+        print(
+            f"[{gid}] Support split depth={depth} reason={split_reason} axis={axis} cut={cut_value:.3f} "
+            f"support {support:.2f}->{score_l:.2f}/{score_r:.2f} "
+            f"area {area:.2f}->{split_area:.2f} ({area_reduction * 100:.1f}% less)"
+        )
+        return _recurse(left, depth + 1) + _recurse(right, depth + 1)
+
+    return _recurse(P, 0)
+
+
+def _box_corners_world(R_bw: torch.Tensor, centre: torch.Tensor, half_sz: torch.Tensor) -> torch.Tensor:
+    signs = torch.tensor(
+        [
+            [-1.0, -1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+            [-1.0, 1.0, -1.0],
+            [-1.0, 1.0, 1.0],
+            [1.0, -1.0, -1.0],
+            [1.0, -1.0, 1.0],
+            [1.0, 1.0, -1.0],
+            [1.0, 1.0, 1.0],
+        ],
+        device=centre.device,
+        dtype=centre.dtype,
+    )
+    return (signs * half_sz.unsqueeze(0)) @ R_bw.t() + centre.unsqueeze(0)
+
+
+def _box_footprint_area(half_sz: torch.Tensor) -> float:
+    return float((4.0 * half_sz[0].clamp(min=1.0e-6) * half_sz[1].clamp(min=1.0e-6)).detach().cpu().item())
+
+
+def _footprint_overlap_in_ref(a: Dict, b: Dict) -> Tuple[float, float, float, float]:
+    """Return inter area, IoU, inter/area_a, inter/area_b in box a's local XY AABB frame."""
+    R_ref = a["R_bw"]
+    C_ref = a["centre"]
+    half_a = a["half_sz"]
+    min_a = -half_a[:2]
+    max_a = half_a[:2]
+
+    corners_b = _box_corners_world(b["R_bw"], b["centre"], b["half_sz"])
+    local_b = (corners_b - C_ref.unsqueeze(0)) @ R_ref
+    min_b = local_b[:, :2].min(dim=0).values
+    max_b = local_b[:, :2].max(dim=0).values
+
+    overlap = torch.minimum(max_a, max_b) - torch.maximum(min_a, min_b)
+    inter_xy = torch.clamp(overlap, min=0.0)
+    inter = float((inter_xy[0] * inter_xy[1]).detach().cpu().item())
+    area_a = float((torch.clamp(max_a[0] - min_a[0], min=1.0e-6) * torch.clamp(max_a[1] - min_a[1], min=1.0e-6)).detach().cpu().item())
+    area_b = float((torch.clamp(max_b[0] - min_b[0], min=1.0e-6) * torch.clamp(max_b[1] - min_b[1], min=1.0e-6)).detach().cpu().item())
+    union = max(area_a + area_b - inter, 1.0e-8)
+    return (
+        inter,
+        min(inter / union, 1.0),
+        min(inter / max(area_a, 1.0e-8), 1.0),
+        min(inter / max(area_b, 1.0e-8), 1.0),
+    )
+
+
+def _footprint_gap_in_ref(a: Dict, b: Dict) -> Tuple[float, float]:
+    """Return XY AABB gaps in box a's local footprint frame."""
+    R_ref = a["R_bw"]
+    C_ref = a["centre"]
+    min_a = -a["half_sz"][:2]
+    max_a = a["half_sz"][:2]
+    corners_b = _box_corners_world(b["R_bw"], b["centre"], b["half_sz"])
+    local_b = (corners_b - C_ref.unsqueeze(0)) @ R_ref
+    min_b = local_b[:, :2].min(dim=0).values
+    max_b = local_b[:, :2].max(dim=0).values
+    gap_x = torch.clamp(torch.maximum(min_b[0] - max_a[0], min_a[0] - max_b[0]), min=0.0)
+    gap_y = torch.clamp(torch.maximum(min_b[1] - max_a[1], min_a[1] - max_b[1]), min=0.0)
+    return float(gap_x.detach().cpu().item()), float(gap_y.detach().cpu().item())
+
+
+def _same_coplanar_layer(
+    a: Dict,
+    b: Dict,
+    *,
+    normal_tol_deg: float = 8.0,
+    normal_sep_tol: float = 0.035,
+) -> bool:
+    n_a = F.normalize(a["R_bw"][:, 2], dim=0)
+    n_b = F.normalize(b["R_bw"][:, 2], dim=0)
+    if float(torch.abs(torch.dot(n_a, n_b)).detach().cpu().item()) < float(np.cos(np.deg2rad(normal_tol_deg))):
+        return False
+    normal_sep = float(torch.abs(torch.dot(b["centre"] - a["centre"], n_a)).detach().cpu().item())
+    thickness_allow = 0.5 * float((a["half_sz"][2] + b["half_sz"][2]).detach().cpu().item()) + normal_sep_tol
+    return normal_sep <= max(normal_sep_tol, thickness_allow)
+
+
+def _points_covered_by_box(points: torch.Tensor, box: Dict, *, xy_margin: float = 0.035, z_margin: float = 0.035) -> float:
+    if points is None or points.numel() == 0:
+        return 0.0
+    pts = points.to(device=box["centre"].device, dtype=box["centre"].dtype)
+    local = (pts - box["centre"].unsqueeze(0)) @ box["R_bw"]
+    half = box["half_sz"]
+    inside = (
+        (local[:, 0].abs() <= half[0] + xy_margin)
+        & (local[:, 1].abs() <= half[1] + xy_margin)
+        & (local[:, 2].abs() <= half[2] + z_margin)
+    )
+    return float(inside.float().mean().detach().cpu().item())
+
+
+def _filter_box_supported_points(
+    points: torch.Tensor,
+    R_bw: torch.Tensor,
+    centre: torch.Tensor,
+    half_sz: torch.Tensor,
+    *,
+    xy_margin: float = 0.005,
+    z_margin: float = 0.005,
+    min_points: int = 50,
+    min_keep_fraction: float = 0.30,
+) -> Tuple[torch.Tensor, float]:
+    """Keep only points represented by the fitted primitive for SQ refinement/dedup."""
+    if points is None or points.numel() == 0:
+        return points, 0.0
+    pts = points.to(device=centre.device, dtype=centre.dtype)
+    local = (pts - centre.unsqueeze(0)) @ R_bw
+    inside = (
+        (local[:, 0].abs() <= half_sz[0] + xy_margin)
+        & (local[:, 1].abs() <= half_sz[1] + xy_margin)
+        & (local[:, 2].abs() <= half_sz[2] + z_margin)
+    )
+    keep_count = int(inside.sum().item())
+    keep_fraction = keep_count / max(int(pts.shape[0]), 1)
+    if keep_count >= min_points and keep_fraction >= min_keep_fraction:
+        return pts[inside], keep_fraction
+    return pts, keep_fraction
+
+
+def _prune_coplanar_overlapping_boxes(
+    records: List[Dict],
+    *,
+    footprint_cover_thresh: float = 0.82,
+    point_cover_thresh: float = 0.90,
+    high_iou_thresh: float = 0.60,
+) -> List[Dict]:
+    """Drop duplicate same-layer boxes while preserving adjacent non-overlapping pieces."""
+    if len(records) <= 1:
+        return records
+
+    def _priority(rec: Dict) -> Tuple[float, float, float]:
+        point_count = float(rec["points"].shape[0]) if rec.get("points") is not None else 0.0
+        support = float(rec.get("support", 0.0))
+        return (point_count * (0.5 + support), _box_footprint_area(rec["half_sz"]), support)
+
+    kept: List[Dict] = []
+    dropped: List[Tuple[Dict, Dict, str]] = []
+    for rec in sorted(records, key=_priority, reverse=True):
+        drop_against = None
+        drop_reason = ""
+        for existing in kept:
+            if not _same_coplanar_layer(existing, rec):
+                continue
+            _, iou, _, overlap_rec = _footprint_overlap_in_ref(existing, rec)
+            point_cover = _points_covered_by_box(rec["points"], existing)
+            if overlap_rec >= footprint_cover_thresh or point_cover >= point_cover_thresh or iou >= high_iou_thresh:
+                drop_against = existing
+                drop_reason = f"iou={iou:.2f}, footprint_cover={overlap_rec:.2f}, point_cover={point_cover:.2f}"
+                break
+        if drop_against is None:
+            kept.append(rec)
+        else:
+            dropped.append((rec, drop_against, drop_reason))
+
+    if dropped:
+        print(f"[dedup] Dropped {len(dropped)} coplanar overlapping duplicate boxes ({len(records)} -> {len(kept)}).")
+        for rec, existing, reason in dropped[:12]:
+            print(
+                f"[dedup] drop {rec.get('gid')}.{rec.get('piece_idx')} "
+                f"covered by {existing.get('gid')}.{existing.get('piece_idx')} ({reason})"
+            )
+        if len(dropped) > 12:
+            print(f"[dedup] ... {len(dropped) - 12} more drops omitted")
+    return kept
+
+
+def _fixed_normal_plane_inliers(
+    P: torch.Tensor,
+    n: torch.Tensor,
+    *,
+    thresh: float = 0.045,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fit only plane offset while keeping the cluster-majority normal fixed."""
+    n = F.normalize(n, dim=0)
+    offsets = P @ n
+    offset = torch.median(offsets)
+    inliers = (offsets - offset).abs() <= float(thresh)
+    if int(inliers.sum().item()) < 3:
+        inliers = torch.ones((P.shape[0],), dtype=torch.bool, device=P.device)
+    c = P[inliers].mean(dim=0)
+    return n, c, inliers
+
+
+def _consensus_axis_hint(
+    candidates: List[Dict],
+    target_n: torch.Tensor,
+    *,
+    normal_tol_deg: float = 10.0,
+    min_votes: int = 6,
+    min_confidence: float = 0.45,
+    max_area_weight: float = 5.0,
+) -> Tuple[torch.Tensor, float, int] | None:
+    """
+    Estimate a shared in-plane axis for a normal family.
+
+    The angle is averaged modulo 90 degrees, because a box frame and its
+    orthogonal swap represent the same rectangular footprint family. This keeps
+    stair/platform pieces edge-to-edge instead of letting each incomplete
+    footprint pick its own min-area slanted axis.
+    """
+    if not candidates:
+        return None
+    target_n = F.normalize(target_n, dim=0)
+    u0, v0, _ = make_local_frame(target_n)
+    cos_tol = float(np.cos(np.deg2rad(normal_tol_deg)))
+    C = torch.zeros((), device=target_n.device, dtype=target_n.dtype)
+    S = torch.zeros((), device=target_n.device, dtype=target_n.dtype)
+    total = torch.zeros((), device=target_n.device, dtype=target_n.dtype)
+    votes = 0
+
+    for cand in candidates:
+        cand_n = cand["normal"].to(device=target_n.device, dtype=target_n.dtype)
+        if float(torch.abs(torch.dot(F.normalize(cand_n, dim=0), target_n)).detach().cpu().item()) < cos_tol:
+            continue
+        R = cand["R_bw"].to(device=target_n.device, dtype=target_n.dtype)
+        area = min(_box_footprint_area(cand["half_sz"]), max_area_weight)
+        support = max(float(cand.get("support", 0.0)), 0.10)
+        planarity = max(float(cand.get("planarity_ratio", 1.0)), 0.25)
+        weight = torch.tensor(area * support * planarity, device=target_n.device, dtype=target_n.dtype)
+        if float(weight.detach().cpu().item()) <= 1.0e-6:
+            continue
+
+        for axis_idx in (0, 1):
+            axis = R[:, axis_idx]
+            axis = axis - (axis @ target_n) * target_n
+            if torch.linalg.norm(axis) < 1.0e-6:
+                continue
+            axis = F.normalize(axis, dim=0)
+            theta = torch.atan2(torch.dot(axis, v0), torch.dot(axis, u0))
+            C = C + weight * torch.cos(4.0 * theta)
+            S = S + weight * torch.sin(4.0 * theta)
+            total = total + weight
+            votes += 1
+
+    if votes < min_votes or float(total.detach().cpu().item()) <= 1.0e-6:
+        return None
+
+    confidence = torch.sqrt(C * C + S * S) / total.clamp(min=1.0e-8)
+    confidence_f = float(confidence.detach().cpu().item())
+    if confidence_f < min_confidence:
+        return None
+
+    theta = 0.25 * torch.atan2(S, C)
+    axis_hint = F.normalize(torch.cos(theta) * u0 + torch.sin(theta) * v0, dim=0)
+    return axis_hint, confidence_f, votes
+
+
+def _merge_normal_similar_segment_candidates(
+    candidates: List[Dict],
+    *,
+    normal_tol_deg: float = 10.0,
+    normal_sep_tol: float = 0.060,
+    min_iou: float = 0.25,
+    min_cover: float = 0.72,
+) -> List[List[Dict]]:
+    """Merge same-layer segment candidates before fitting primitives."""
+    if len(candidates) <= 1:
+        return [[cand] for cand in candidates]
+
+    cos_tol = float(np.cos(np.deg2rad(normal_tol_deg)))
+    parent = list(range(len(candidates)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    for i in range(len(candidates)):
+        for j in range(i + 1, len(candidates)):
+            a = candidates[i]
+            b = candidates[j]
+            n_dot = float(torch.abs(torch.dot(a["normal"], b["normal"])).detach().cpu().item())
+            if n_dot < cos_tol:
+                continue
+            if not _same_coplanar_layer(a, b, normal_tol_deg=normal_tol_deg, normal_sep_tol=normal_sep_tol):
+                continue
+            _, iou_ab, cover_a, cover_b = _footprint_overlap_in_ref(a, b)
+            footprint_related = (
+                iou_ab >= min_iou
+                or max(cover_a, cover_b) >= min_cover
+            )
+            if footprint_related:
+                union(i, j)
+
+    groups_by_root: Dict[int, List[Dict]] = {}
+    for idx, cand in enumerate(candidates):
+        groups_by_root.setdefault(find(idx), []).append(cand)
+    groups = list(groups_by_root.values())
+    if len(groups) != len(candidates):
+        merged_count = len(candidates) - len(groups)
+        sizes = sorted((len(group) for group in groups if len(group) > 1), reverse=True)
+        print(f"[cluster-merge] merged {merged_count} normal-similar same-layer clusters ({len(candidates)} -> {len(groups)}), group_sizes={sizes[:12]}")
+    return groups
     
 def process_global_segments(
     global_segments: Dict,
@@ -2465,7 +3227,9 @@ def process_global_segments(
     Process global segments with compact 3D bounding box estimation.
 
     """
-    S_items, R_items, T_items, pts_items = [], [], [], []
+    segment_candidates: List[Dict] = []
+    piece_records: List[Dict] = []
+    legacy_stair75_fit = _env_flag("CRISP_SQS_LEGACY_STAIR75", False)
 
     for gid, frame_segs in global_segments.items():
         if len(frame_segs) < min_frames:
@@ -2477,53 +3241,174 @@ def process_global_segments(
             avg_normal   = seg['avg_normal'].to(device)
             assert world_points.dim() == 2 and world_points.shape[1] == 3, f"world_points must be (N,3), got {world_points.shape}"
             assert avg_normal.dim() == 1 and avg_normal.shape[0] == 3,     f"avg_normal must be (3,), got {avg_normal.shape}"
-            pts_list.append(world_points); normal_list.append(avg_normal)
+            finite_points = torch.isfinite(world_points).all(dim=1) & (torch.linalg.norm(world_points, dim=1) > 1.0e-8)
+            if int(finite_points.sum().item()) < 3:
+                continue
+            pts_list.append(world_points[finite_points])
+            normal_list.append(avg_normal)
+
+        if not pts_list:
+            continue
 
         P_all = torch.cat(pts_list, 0)
         assert P_all.dim() == 2 and P_all.shape[1] == 3, f"Concatenated points must be (N, 3), got {P_all.shape}"
-        n_avg = F.normalize(torch.stack(normal_list).mean(0), dim=0)
+        n_avg = _oriented_mean_normal(torch.stack(normal_list))
 
         if use_plane_constraint:
-
             n, c, inliers = robust_plane_ransac(P_all, n_avg)
+            if n is None or c is None or inliers is None:
+                n = n_avg
+                c = P_all.mean(dim=0)
+                inliers = torch.ones((P_all.shape[0],), dtype=torch.bool, device=P_all.device)
             planarity_ratio = (inliers.float().mean()).item()
-
-
-            print(f"[{gid}] Using plane-constrained bbox (planarity: {planarity_ratio:.2f})")
             P = P_all[inliers] if inliers.sum() > 50 else P_all
+        else:
+            n = n_avg
+            c = P_all.mean(dim=0)
+            P = P_all
+            planarity_ratio = 1.0
 
-            # first try single rectangle
-            R_bw1, centre1, half_sz1, rect_ratio = fit_one_plane_box(P, n, c, gid)
-
-            if rect_ratio < 0.70 and P.shape[0] >= 300:
-                print(f"[{gid}] Rectangularity {rect_ratio:.2f} too low → splitting into sub-planes")
-                pieces = split_plane_clusters(P, n, c, gid, tau=0.70, max_splits=3, min_pts=150)
-                for R_bw, centre, half_sz in pieces:
-                    half_sz = half_sz.clamp(min=0.02)
-                    S_items.append(torch.log(half_sz))
-                    R_items.append(R_bw.t().contiguous())
-                    T_items.append(centre)
-                    pts_items.append(P_all.cpu())
-                    print(f"[{gid}] Sub-box dims: {(half_sz * 2).detach().cpu().numpy()}")
-                continue  # go to next gid
-
-            # single box path
-            half_sz = half_sz1.clamp(min=0.02)
-            R_bw, centre = R_bw1, centre1
-
-
-        # clamp & store
+        if P.shape[0] < 3:
+            continue
+        try:
+            R_bw, centre, half_sz, _, support, _ = _fit_supported_plane_box(
+                P,
+                n,
+                c,
+                gid,
+                edge_trim=not legacy_stair75_fit,
+            )
+        except Exception:
+            R_bw, centre, half_sz, _ = fit_one_plane_box(P, n, c, gid)
+            support = 0.0
         half_sz = half_sz.clamp(min=0.02)
-        S_items.append(torch.log(half_sz))
-        R_items.append(R_bw.t().contiguous())  # world→body
-        T_items.append(centre)
-        pts_items.append(P_all.cpu())
+        segment_candidates.append(
+            {
+                "gid": gid,
+                "points": P.detach(),
+                "all_points": P_all.detach(),
+                "normal": F.normalize(n, dim=0),
+                "vote_count": int(P.shape[0]),
+                "planarity_ratio": float(planarity_ratio),
+                "R_bw": R_bw,
+                "centre": centre,
+                "half_sz": half_sz,
+                "support": float(support),
+            }
+        )
 
-        # checks
+    candidate_groups = (
+        _merge_normal_similar_segment_candidates(segment_candidates)
+        if use_plane_constraint
+        else [[cand] for cand in segment_candidates]
+    )
+
+    for group_idx, group in enumerate(candidate_groups):
+        if not group:
+            continue
+        group_points = torch.cat([cand["points"].to(device) for cand in group], dim=0)
+        if group_points.shape[0] < 3:
+            continue
+        dominant = max(group, key=lambda cand: cand["vote_count"])
+        n = dominant["normal"].to(device=device, dtype=group_points.dtype)
+        for cand in group:
+            cand_n = cand["normal"].to(device=device, dtype=group_points.dtype)
+            if torch.dot(cand_n, n) < 0:
+                cand["normal"] = -cand["normal"]
+        n, c, inliers = _fixed_normal_plane_inliers(group_points, n, thresh=0.045)
+        P = group_points[inliers] if int(inliers.sum().item()) > 50 else group_points
+        gid_label = dominant["gid"] if len(group) == 1 else f"{dominant['gid']}+{len(group)-1}"
+        mean_planarity = float(np.mean([cand["planarity_ratio"] for cand in group]))
+        axis_hint_info = None if legacy_stair75_fit else _consensus_axis_hint(segment_candidates, n)
+        axis_hint = axis_hint_info[0] if axis_hint_info is not None else None
+        axis_msg = ""
+        if axis_hint_info is not None:
+            _, axis_confidence, axis_votes = axis_hint_info
+            axis_msg = f", axis_hint_conf={axis_confidence:.2f}, axis_votes={axis_votes}"
+        print(
+            f"[{gid_label}] Fitting merged normal cluster "
+            f"(segments={len(group)}, dominant={dominant['gid']}, points={int(P.shape[0])}, "
+            f"mean_planarity={mean_planarity:.2f}{axis_msg})"
+        )
+        if legacy_stair75_fit:
+            R_bw, centre, half_sz, _, support, _ = _fit_supported_plane_box(
+                P,
+                n,
+                c,
+                gid_label,
+                axis_hint=None,
+                edge_trim=False,
+            )
+            pieces = [(R_bw, centre, half_sz, P.detach().cpu(), support)]
+        else:
+            pieces = fit_support_aware_plane_boxes(
+                P,
+                n,
+                c,
+                gid_label,
+                max_depth=2,
+                min_pts=180,
+                min_support=0.48,
+                min_improvement=0.12,
+                axis_hint=axis_hint,
+            )
+        if not pieces:
+            R_bw, centre, half_sz, _ = fit_one_plane_box(P, n, c, gid_label)
+            pieces = [(R_bw, centre, half_sz, P.detach().cpu(), 0.0)]
+
+        for piece_idx, (R_bw, centre, half_sz, piece_points, support) in enumerate(pieces):
+            half_sz = half_sz.clamp(min=0.02)
+            piece_points_dev = piece_points.to(device=centre.device, dtype=centre.dtype)
+            fit_points_dev, fit_cover = _filter_box_supported_points(
+                piece_points_dev,
+                R_bw,
+                centre,
+                half_sz,
+            )
+            piece_records.append(
+                {
+                    "gid": gid_label,
+                    "piece_idx": piece_idx,
+                    "R_bw": R_bw,
+                    "centre": centre,
+                    "half_sz": half_sz,
+                    "points": fit_points_dev,
+                    "raw_point_count": int(piece_points_dev.shape[0]),
+                    "fit_cover": float(fit_cover),
+                    "support": float(support),
+                }
+            )
+            print(
+                f"[{gid_label}.{piece_idx}] Box dimensions: {(half_sz * 2).cpu().numpy()} "
+                f"support={support:.2f} points={int(piece_points.shape[0])} "
+                f"fit_points={int(fit_points_dev.shape[0])} fit_cover={fit_cover:.2f}"
+            )
+
+    piece_records = _prune_coplanar_overlapping_boxes(piece_records)
+    S_items, R_items, T_items, pts_items = [], [], [], []
+    for export_idx, rec in enumerate(piece_records):
+        half_sz = rec["half_sz"].clamp(min=0.02)
+        R_bw = rec["R_bw"]
+        centre = rec["centre"]
+        piece_points = rec["points"]
+        normal_np = F.normalize(R_bw[:, 2], dim=0).detach().cpu().numpy()
+        centre_np = centre.detach().cpu().numpy()
+        print(
+            f"[export-primitive] idx={export_idx} gid={rec.get('gid')}.{rec.get('piece_idx')} "
+            f"dims={(half_sz * 2).detach().cpu().numpy()} support={float(rec.get('support', 0.0)):.2f} "
+            f"points={int(piece_points.shape[0]) if piece_points is not None else 0} "
+            f"raw_points={int(rec.get('raw_point_count', int(piece_points.shape[0]) if piece_points is not None else 0))} "
+            f"fit_cover={float(rec.get('fit_cover', 1.0)):.2f} "
+            f"normal={normal_np} centre={centre_np}"
+        )
+        S_items.append(torch.log(half_sz))
+        R_items.append(R_bw.t().contiguous())  # stored as world→body; export converts back to body→world
+        T_items.append(centre)
+        pts_items.append(piece_points.detach().cpu())
+
         assert S_items[-1].shape == (3,), f"S_item must be (3,), got {S_items[-1].shape}"
         assert R_items[-1].shape == (3, 3), f"R_item must be (3, 3), got {R_items[-1].shape}"
         assert T_items[-1].shape == (3,), f"T_item must be (3,), got {T_items[-1].shape}"
-        print(f"[{gid}] Bbox dimensions: {(half_sz * 2).cpu().numpy()}")
 
     return dict(S_items=S_items, R_items=R_items, T_items=T_items, pts_items=pts_items)
 
@@ -3061,6 +3946,7 @@ def interval_flow_segmentation_pipeline_with_vis(
     stat_cam: bool = False,
     contact_points: Optional[np.ndarray] = None, 
     debug_dir: Path = Path('debug_segments'),
+    segment_min_frames: int = 2,
     **kwargs: Any,
 ) -> Dict[str, List]:
     """
@@ -3160,7 +4046,7 @@ def interval_flow_segmentation_pipeline_with_vis(
     results = process_global_segments(
         global_segments,
         all_frame_segments,
-        min_frames=2,
+        min_frames=segment_min_frames,
         device=device
     )
 

@@ -54,6 +54,10 @@ fi
 export PYTHONPATH="$PYTHON_SHIM_DIR${PYTHONPATH:+:$PYTHONPATH}"
 export TORCH_HOME="${TORCH_HOME:-$HOME/.cache/torch}"
 export PYTHONUNBUFFERED=1
+CRISP_BIN_DIR="${CRISP_BIN_DIR:-/home/ubuntu/miniconda3/envs/crisp/bin}"
+if [[ -d "$CRISP_BIN_DIR" ]]; then
+    export PATH="$CRISP_BIN_DIR:$PATH"
+fi
 
 cd "$REPO_ROOT/scripts"
 exec bash all_gv.sh "$ROOT_DIR"

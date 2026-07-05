@@ -5,12 +5,15 @@
 [submodule "prep/MogeSAM"]
 	path = prep/MogeSAM
 	url = https://github.com/CRISP-Real2Sim/megasam-advanced.git
+	branch = main
 [submodule "prep/HMR"]
 	path = prep/HMR
 	url = https://github.com/CRISP-Real2Sim/HMR.git
+	branch = main
 [submodule "prep/UFM"]
 	path = prep/UFM
 	url = https://github.com/UniFlowMatch/UFM
+	branch = main
 [submodule "prep/Contact-Predictor"]
 	path = prep/Contact-Predictor
 	url = https://github.com/CRISP-Real2Sim/Contact-Predictor.git
@@ -19,3 +22,23 @@
 	path = prep/NKSR
 	url = https://github.com/nv-tlabs/NKSR.git
 	branch = public
+[submodule "prep/GeoCalib"]
+	path = prep/GeoCalib
+	url = https://github.com/hongsukchoi/GeoCalib.git
+	branch = main
+[submodule "prep/FoundationPose"]
+	path = prep/FoundationPose
+	url = https://github.com/NVlabs/FoundationPose.git
+	branch = main
+[submodule "prep/sam-3d-objects"]
+	path = prep/sam-3d-objects
+	url = https://github.com/facebookresearch/sam-3d-objects.git
+	branch = main
+[submodule "prep/vggt-omega"]
+	path = prep/vggt-omega
+	url = https://github.com/facebookresearch/vggt-omega.git
+	branch = main
+[submodule "real2sim2real"]
+	path = real2sim2real
+	url = https://github.com/Z1hanW/holosoma-crisp.git
+	branch = main

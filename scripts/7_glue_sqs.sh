@@ -32,7 +32,32 @@ fi
 SPLIT_INPUT="${1%/}"
 HMR_TYPE="${2:-gv}"
 LOG_DIR="${LOG_DIR:-/tmp/vis_megasam_logs}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 mkdir -p "$LOG_DIR"
+
+BACKEND_RAW="${SCENE_RECON_BACKEND:-megasam}"
+BACKEND_RAW="${BACKEND_RAW,,}"
+case "$BACKEND_RAW" in
+  megasam|moge|tapip3d)
+    BACKEND="megasam"
+    DEFAULT_PRIORS_ROOT="$REPO_ROOT/results/init/vslam/raw_mega_priors"
+    DEFAULT_ARTIFACT_OUTPUT_DIR="$REPO_ROOT/results/output/scene"
+    ;;
+  vggt_omega|vggt-omega|vggt)
+    BACKEND="vggt_omega"
+    DEFAULT_PRIORS_ROOT="$REPO_ROOT/results/init/vslam/raw_vggt_omega_priors"
+    DEFAULT_ARTIFACT_OUTPUT_DIR="$REPO_ROOT/results/output/scene_vggt_omega_consistent_camera_min1"
+    ;;
+  *)
+    echo "Unknown SCENE_RECON_BACKEND='$SCENE_RECON_BACKEND'" >&2
+    exit 2
+    ;;
+esac
+SCENE_PRIOR_BASE_PATH="${SCENE_PRIOR_BASE_PATH:-$DEFAULT_PRIORS_ROOT}"
+SCENE_CAMERA_ROOT="${SCENE_CAMERA_ROOT:-}"
+SCENE_ARTIFACT_OUTPUT_DIR="${SCENE_ARTIFACT_OUTPUT_DIR:-$DEFAULT_ARTIFACT_OUTPUT_DIR}"
+SCENE_NPZ_DIR="${SCENE_NPZ_DIR:-$REPO_ROOT/results/output/scene}"
+HMR_RESULTS_ROOT="${HMR_RESULTS_ROOT:-$REPO_ROOT/results/init/hmr}"
 
 RUN_NKSR_RAW="${RUN_NKSR:-off}"
 case "${RUN_NKSR_RAW,,}" in
@@ -40,6 +65,16 @@ case "${RUN_NKSR_RAW,,}" in
   off|false|0|no|n) RUN_NKSR=0 ;;
   *)
     echo "Invalid RUN_NKSR='$RUN_NKSR_RAW' (use on/off or true/false)" >&2
+    exit 2
+    ;;
+esac
+
+FORCE_FUSE_RAW="${FORCE_FUSE:-off}"
+case "${FORCE_FUSE_RAW,,}" in
+  on|true|1|yes|y) FORCE_FUSE=1 ;;
+  off|false|0|no|n) FORCE_FUSE=0 ;;
+  *)
+    echo "Invalid FORCE_FUSE='$FORCE_FUSE_RAW' (use on/off or true/false)" >&2
     exit 2
     ;;
 esac
@@ -82,11 +117,13 @@ backfill_sqs_params_inline() {
   local eps1="${BACKFILL_EPS1:-0.1}"
   local eps2="${BACKFILL_EPS2:-0.1}"
 
-  python - "$scene_root" "$eps1" "$eps2" <<'PY'
+  "$PYTHON_BIN" - "$scene_root" "$eps1" "$eps2" <<'PY'
 from __future__ import annotations
 
 import json
+import shutil
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -159,6 +196,32 @@ def clean_stale_pieces(pieces_dir: Path, keep_paths: list[Path]) -> list[str]:
     return removed
 
 
+def load_existing_params(sqs_root: Path, expected_count: int) -> np.ndarray | None:
+    candidates = [sqs_root / "sqs_params.npz", sqs_root / "sqs_params.npy"]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            if path.suffix == ".npz":
+                with np.load(path, allow_pickle=True) as data:
+                    if "params" not in data.files:
+                        continue
+                    params = np.asarray(data["params"], dtype=np.float32)
+            else:
+                params = np.asarray(np.load(path, allow_pickle=True), dtype=np.float32)
+        except Exception:
+            continue
+        if params.ndim == 2 and params.shape == (expected_count, 11):
+            return params.copy()
+    return None
+
+
+def rotations_from_params(params: np.ndarray) -> np.ndarray:
+    if params.size == 0:
+        return np.zeros((0, 3, 3), dtype=np.float32)
+    return Rotation.from_euler("ZYX", params[:, 5:8]).as_matrix().astype(np.float32)
+
+
 def main() -> None:
     scene_root = Path(sys.argv[1]).resolve()
     eps1 = float(sys.argv[2])
@@ -177,6 +240,41 @@ def main() -> None:
         raise FileNotFoundError(f"URDF references missing piece files: {missing}")
 
     removed = clean_stale_pieces(pieces_dir, piece_paths)
+
+    existing_params = load_existing_params(sqs_root, len(piece_paths))
+    if existing_params is not None:
+        params_np = existing_params.astype(np.float32, copy=True)
+        rot_np = rotations_from_params(params_np)
+        piece_names = [path.name for path in piece_paths]
+
+        np.save(sqs_root / "sqs_params.npy", params_np)
+        sqs_params_npz = sqs_root / "sqs_params.npz"
+        with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            np.savez_compressed(
+                tmp_path,
+                params=params_np,
+                piece_name_utf8=np.asarray(piece_names, dtype=f"<U{max((len(name) for name in piece_names), default=1)}"),
+                piece_rot_p2w=rot_np,
+            )
+            shutil.copyfile(tmp_path, sqs_params_npz)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+        summary = {
+            "scene_root": str(scene_root),
+            "num_pieces": int(len(piece_paths)),
+            "removed_stale_pieces": removed,
+            "preserved_existing_params": True,
+            "sqs_params_npy": str((sqs_root / "sqs_params.npy").resolve()),
+            "sqs_params_npz": str(sqs_params_npz.resolve()),
+        }
+        print(json.dumps(summary, indent=2))
+        return
 
     params = []
     rot_mats = []
@@ -218,19 +316,29 @@ def main() -> None:
     rot_np = np.stack(rot_mats, axis=0).astype(np.float32) if rot_mats else np.zeros((0, 3, 3), dtype=np.float32)
 
     np.save(sqs_root / "sqs_params.npy", params_np)
-    np.savez_compressed(
-        sqs_root / "sqs_params.npz",
-        params=params_np,
-        piece_name_utf8=np.asarray(piece_names, dtype=f"<U{max((len(name) for name in piece_names), default=1)}"),
-        piece_rot_p2w=rot_np,
-    )
+    sqs_params_npz = sqs_root / "sqs_params.npz"
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        np.savez_compressed(
+            tmp_path,
+            params=params_np,
+            piece_name_utf8=np.asarray(piece_names, dtype=f"<U{max((len(name) for name in piece_names), default=1)}"),
+            piece_rot_p2w=rot_np,
+        )
+        shutil.copyfile(tmp_path, sqs_params_npz)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 
     summary = {
         "scene_root": str(scene_root),
         "num_pieces": int(len(piece_paths)),
         "removed_stale_pieces": removed,
         "sqs_params_npy": str((sqs_root / "sqs_params.npy").resolve()),
-        "sqs_params_npz": str((sqs_root / "sqs_params.npz").resolve()),
+        "sqs_params_npz": str(sqs_params_npz.resolve()),
     }
     print(json.dumps(summary, indent=2))
 
@@ -253,31 +361,55 @@ if (( ${#seq_dirs[@]} == 0 )); then
 fi
 
 echo "Found ${#seq_dirs[@]} sequences in $DATA_PATH. Logs -> $LOG_DIR"
+echo "Scene backend: $BACKEND"
+echo "HMR results root: $HMR_RESULTS_ROOT"
 
 for seq_dir in "${seq_dirs[@]}"; do
   seq_name="$(basename "${seq_dir%/}")"
-  results_file="$REPO_ROOT/results/output/scene/${seq_name}_${HMR_TYPE}_sgd_cvd_hr.npz"
+  if [[ "$BACKEND" == "megasam" ]]; then
+    results_file="$SCENE_NPZ_DIR/${seq_name}_${HMR_TYPE}_sgd_cvd_hr.npz"
+  else
+    results_file="$SCENE_NPZ_DIR/${seq_name}_${BACKEND}_${HMR_TYPE}_sgd_cvd_hr.npz"
+  fi
   if [[ ! -f "$results_file" ]]; then
     echo "Skipping ${seq_name}: missing results file $results_file" >&2
     continue
   fi
 
-  logfile="${LOG_DIR}/${seq_name}.log"
+  logfile="${LOG_DIR}/${seq_name}_${BACKEND}.log"
   echo "[$(date +'%F %T')] Running scripts for ${seq_name} (log: $logfile)"
 
   {
-    scene_mesh_dir="$REPO_ROOT/results/output/scene/${seq_name}/${HMR_TYPE}/scene_mesh_sqs"
-    if [[ -d "$scene_mesh_dir" && -f "$scene_mesh_dir/scene_mesh_sqs.obj" && -f "$scene_mesh_dir/scene_mesh_sqs.urdf" ]]; then
+    scene_mesh_dir="$SCENE_ARTIFACT_OUTPUT_DIR/${seq_name}/${HMR_TYPE}/scene_mesh_sqs"
+    if (( FORCE_FUSE == 0 )) && [[ -d "$scene_mesh_dir" && -f "$scene_mesh_dir/scene_mesh_sqs.obj" && -f "$scene_mesh_dir/scene_mesh_sqs.urdf" ]]; then
       echo "===== $(date +'%F %T') backfill_sqs_params_inline ====="
-      backfill_sqs_params_inline "$REPO_ROOT/results/output/scene/${seq_name}/${HMR_TYPE}"
+      backfill_sqs_params_inline "$SCENE_ARTIFACT_OUTPUT_DIR/${seq_name}/${HMR_TYPE}"
     else
       echo "===== $(date +'%F %T') vis.sh ====="
-      HMR_TYPE="$HMR_TYPE" SAVE_MODE=on bash "$VIS_SCRIPT" "$seq_name"
+      PYTHON_BIN="$PYTHON_BIN" \
+        HMR_TYPE="$HMR_TYPE" \
+        SAVE_MODE=on \
+        FUSION_INTERVAL="${FUSION_INTERVAL:-}" \
+        SEGMENT_MODE="${SEGMENT_MODE:-}" \
+        SCENE_FILE="$results_file" \
+        SCENE_PRIOR_BASE_PATH="$SCENE_PRIOR_BASE_PATH" \
+        SCENE_CAMERA_ROOT="$SCENE_CAMERA_ROOT" \
+        SCENE_OUTPUT_DIR="$SCENE_ARTIFACT_OUTPUT_DIR" \
+        HMR_RESULTS_ROOT="$HMR_RESULTS_ROOT" \
+        bash "$VIS_SCRIPT" "$seq_name"
+      if [[ -d "$scene_mesh_dir" && -f "$scene_mesh_dir/scene_mesh_sqs.obj" && -f "$scene_mesh_dir/scene_mesh_sqs.urdf" ]]; then
+        echo "===== $(date +'%F %T') backfill_sqs_params_inline ====="
+        backfill_sqs_params_inline "$SCENE_ARTIFACT_OUTPUT_DIR/${seq_name}/${HMR_TYPE}"
+      fi
     fi
 
     if (( RUN_NKSR == 1 )); then
       echo "===== $(date +'%F %T') nksr ====="
-      HMR_TYPE="$HMR_TYPE" bash "$SCRIPT3" "$seq_name"
+      SCENE_OUTPUT_DIR="$SCENE_ARTIFACT_OUTPUT_DIR" \
+        NKSR_INPUT_NPZ="$SCENE_ARTIFACT_OUTPUT_DIR/${seq_name}/${HMR_TYPE}/nksr_input/pointcloud_world.npz" \
+        NKSR_OUTPUT_DIR="$SCENE_ARTIFACT_OUTPUT_DIR/${seq_name}/${HMR_TYPE}/nksr" \
+        HMR_TYPE="$HMR_TYPE" \
+        bash "$SCRIPT3" "$seq_name"
     fi
 
   } >"$logfile" 2>&1

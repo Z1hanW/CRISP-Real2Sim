@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 # from sqs_utils.superquadric import *
 from pytorch3d.transforms import euler_angles_to_matrix
 import os, shutil
+import tempfile
 import copy
 import viser
 import viser.extras
@@ -53,6 +54,24 @@ from pathlib import Path
 import numpy as np
 import trimesh
 import xml.etree.ElementTree as ET
+
+
+def save_npz_portable(path, *, compressed=False, **arrays):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        if compressed:
+            np.savez_compressed(tmp_path, **arrays)
+        else:
+            np.savez(tmp_path, **arrays)
+        shutil.copyfile(tmp_path, path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 from pathlib import Path
 import numpy as np
 import trimesh
@@ -176,8 +195,9 @@ def save_custom_mesh(mesh_parts, tgt_folder, params_np=None):
     if params_np is not None:
         params_np = np.asarray(params_np, dtype=np.float32)
         np.save(os.path.join(tgt_folder, "sqs_params.npy"), params_np)
-        np.savez_compressed(
+        save_npz_portable(
             os.path.join(tgt_folder, "sqs_params.npz"),
+            compressed=True,
             params=params_np,
         )
 
@@ -873,22 +893,47 @@ def main(
     transfer_data: bool = False, 
     hmr_type: str = 'gv',
     moge_base_path: Path | str | None = None,
+    scene_prior_base_path: Path | str | None = None,
+    scene_camera_root: Path | str | None = None,
+    sequence_name: Optional[str] = None,
+    scene_output_dir: Path | str | None = None,
+    hmr_results_root: Path | str | None = None,
     detailed_planes: bool = False,
     segment_mode: Literal["frame_union", "cluster_3d"] = "frame_union",
     static_camera: bool = False,
     sq_loss_threshold: Optional[float] = None,
     save_clustering: bool = True,
+    segment_min_frames: int = 2,
+    fusion_interval: int = 7,
     use_contact: bool = False,
+    port: Optional[int] = None,
 ) -> None:
     from pathlib import Path  # <-- Import Path here if not already imported
-    tgt_name = str(data).split('_sgd')[0].split('/')[-1]   # gives 'MPH112_00169_01_tram'
-    tgt_name = "_".join(tgt_name.split("_")[:-1]) 
+    inferred_tgt_name = str(data).split('_sgd')[0].split('/')[-1]   # gives 'MPH112_00169_01_tram'
+    inferred_tgt_name = "_".join(inferred_tgt_name.split("_")[:-1])
+    tgt_name = sequence_name or inferred_tgt_name
+    if scene_prior_base_path is not None:
+        moge_base_path = scene_prior_base_path
     if moge_base_path is None:
         moge_base_path = VSLAM_PRIORS_DIR
     moge_base_path = Path(moge_base_path)
+    if scene_camera_root is None:
+        if "vggt_omega" in str(moge_base_path).lower() or "vggt-omega" in str(moge_base_path).lower():
+            scene_camera_root = VSLAM_MEGACAM_DIR.parent / "vggt_omega_cam"
+        else:
+            scene_camera_root = VSLAM_MEGACAM_DIR
+    scene_camera_root = Path(scene_camera_root)
+    if scene_output_dir is None:
+        scene_output_dir = SCENE_OUTPUT_DIR
+    scene_output_dir = Path(scene_output_dir)
     moge_data = moge_base_path / f'{tgt_name}.npz'
+    if not moge_data.exists():
+        raise FileNotFoundError(
+            f"Missing scene prior for sequence '{tgt_name}': {moge_data}. "
+            "Pass --sequence-name and --scene-prior-base-path for backend-specific test files."
+        )
     # compare_npz_shapes(data, moge_data)
-    tgt_folder = str((SCENE_OUTPUT_DIR / tgt_name))
+    tgt_folder = str((scene_output_dir / tgt_name))
     # if Path(tgt_folder).exists():
     #   shutil.rmtree(Path(tgt_folder))
 
@@ -920,7 +965,7 @@ def main(
 
     def generate_four_digit():
         return random.randint(1000, 9999)
-    server = viser.ViserServer(port=generate_four_digit())
+    server = viser.ViserServer(port=int(port) if port is not None else generate_four_digit())
     # serializer = server.get_scene_serializer()
     if share:
         server.request_share_url()
@@ -941,7 +986,7 @@ def main(
 
     npz_cam_data = data# pred_cam
     device='cuda'
-    base = VSLAM_MEGACAM_DIR
+    base = scene_camera_root
     candid = sorted(p for p in base.iterdir() if p.is_dir() and p.name.startswith(tgt_name))
 
     if not candid:
@@ -957,6 +1002,13 @@ def main(
     pred_cam[key_T] = (npz_cam_data['cam_c2w'][:, :3, 3] )* npz_cam_data['scale']
     world_cam_R = torch.tensor(pred_cam[key_R]).to(device)#[:num_frames]
     world_cam_T = torch.tensor(pred_cam[key_T]).to(device)#[:num_frames]
+
+    source_frame_indices = None
+    if hasattr(npz_cam_data, "files"):
+        if "valid_source_frame_indices" in npz_cam_data.files:
+            source_frame_indices = np.asarray(npz_cam_data["valid_source_frame_indices"], dtype=np.int64)
+        elif "source_frame_indices" in npz_cam_data.files:
+            source_frame_indices = np.asarray(npz_cam_data["source_frame_indices"], dtype=np.int64)
 
     from smpl_utils import (
         process_tram_smpl,
@@ -984,7 +1036,9 @@ def main(
             max_frames=max_frames,
             smpl_model=smpl,
             use_world=use_world,
-            device='cuda'
+            device='cuda',
+            frame_indices=source_frame_indices,
+            hmr_results_root=hmr_results_root,
         )
         
         num_frames = smpl_results['num_frames']
@@ -999,7 +1053,7 @@ def main(
         smplx_height = smpl_results.get('smplx_height')
 
     
-    save_dir = SCENE_OUTPUT_DIR / tgt_name / hmr_type
+    save_dir = scene_output_dir / tgt_name / hmr_type
     save_dir.mkdir(parents=True, exist_ok=True)
     hmr_dir = save_dir / 'hmr'
     hmr_dir.mkdir(parents=True, exist_ok=True)
@@ -1181,7 +1235,7 @@ def main(
         if torch.is_tensor(smplx_joints_world)
         else np.asarray(smplx_joints_world)
     )
-    np.savez(
+    save_npz_portable(
         hmr_dir / f"hps_track_smplx.npz",
         global_joint_positions=joints_np.astype(np.float32, copy=False), # [T, J, 3]
         height=np.float32(smplx_height),
@@ -1221,7 +1275,7 @@ def main(
         )
         gui_next_frame = server.gui.add_button("Next Frame", disabled=True)
         gui_prev_frame = server.gui.add_button("Prev Frame", disabled=True)
-        gui_playing = server.gui.add_checkbox("Playing", True)
+        gui_playing = server.gui.add_checkbox("Playing", False)
 
 
         gui_next_sqs = server.gui.add_button("Next SQs", disabled=True)
@@ -1845,7 +1899,7 @@ def main(
                 contact_smooth_window=5,
                 velocity_outlier_threshold=2.5,
                 velocity_smooth_window=9,
-                debug_dir=str(SCENE_OUTPUT_DIR / tgt_name / 'contact_debug')
+                debug_dir=str(scene_output_dir / tgt_name / 'contact_debug')
             )
             if select_frames_and_collect_contacts is not None:
                 try:
@@ -1886,7 +1940,7 @@ def main(
         contact_global_handles.append(contact_handle)
 
     if TTTTTTEST == False:
-        interval = 7# 30#stttride=  (num_frames // 90) + 1
+        interval = max(1, int(fusion_interval))
         frame_indices = []  # Track which frames we're processing
         if debug:
           num_frames = interval+1
@@ -1908,7 +1962,7 @@ def main(
             
             if single_image == True:
                 seg_network = Vis()
-                parent_folder = str(VSLAM_MEGACAM_DIR / tgt_name)
+                parent_folder = str(scene_camera_root / tgt_name)
                 if len(mono_normals)==0:
                     mono_pc, mono_normal, rgb, colors__, extras = frame.get_mono_data(
                         i,
@@ -1918,12 +1972,9 @@ def main(
                     )
 
                     depth, rotation, translation, K, points_bg_map, plane_info = extras
-                    distance_filtering=True
-                    # real_normal
-                    if distance_filtering:
-                      points_bg_map_, _, depth, mono_normal_ = filter_bg_points_by_human_distance(points_bg_map, points_bg_map, human_transl_np, depth, mono_normal, max_dist=2.7)
-                    else:
-                      _, _, depth, _ = filter_bg_points_by_human_distance(points_bg_map, points_bg_map, human_transl_np, depth, max_dist=1)
+                    valid_nksr_mask = np.isfinite(points_bg_map).all(axis=2) & (np.linalg.norm(points_bg_map, axis=2) > 1e-8)
+                    points_bg_map_ = np.asarray(points_bg_map[valid_nksr_mask], dtype=np.float32)
+                    mono_normal_ = np.asarray(mono_normal[valid_nksr_mask], dtype=np.float32)
 
                     bg_position, bg_color = mono_pc, colors__
                     points_bg_map_nksr.append(points_bg_map_)
@@ -1981,12 +2032,11 @@ def main(
                     _, _, extras = frame.get_filtered_point_cloud(downsample_factor, bg_downsample_factor=1)
                 
                 '''
-                depth, rotation, translation, K, points_bg_map = extras
-                distance_filtering=True
-                if distance_filtering:
-                  points_bg_map_, _, depth, real_normal_ = filter_bg_points_by_human_distance(points_bg_map, points_bg_map, human_transl_np, depth, real_normal, max_dist=2.7)
-                else:
-                  _, _, depth, _ = filter_bg_points_by_human_distance(points_bg_map, points_bg_map, human_transl_np, depth, max_dist=1)
+                depth, rotation, translation, K, points_bg_map = extras[:5]
+                points_bg_map_nksr_frame = extras[5] if len(extras) > 5 else points_bg_map
+                valid_nksr_mask = np.isfinite(points_bg_map_nksr_frame).all(axis=2) & (np.linalg.norm(points_bg_map_nksr_frame, axis=2) > 1e-8)
+                points_bg_map_ = np.asarray(points_bg_map_nksr_frame[valid_nksr_mask], dtype=np.float32)
+                real_normal_ = np.asarray(real_normal[valid_nksr_mask], dtype=np.float32)
                 points_bg_map_nksr.append(points_bg_map_)
                 points_normal_nksr.append(real_normal_)
 
@@ -2206,7 +2256,7 @@ def main(
             if single_image:
               # break
               save_point_cloud_ply(
-                path=str(SCENE_OUTPUT_DIR / tgt_name / 'points.ply'),
+                path=str(scene_output_dir / tgt_name / 'points.ply'),
                 points=bg_position,
                 colors=bg_color,      
                 ascii=False           # 大点云推荐 False（二进制）
@@ -2255,24 +2305,30 @@ def main(
                             bg_positions,
                             normals,
                             out_dir: str = "cache",
-                            fmt: str = "pt") -> str:
+                            fmt: str = "pt",
+                            tag: str = "") -> str:
             """
             """
             out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+            safe_tag = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in tag)
+            suffix = f"_{safe_tag}" if safe_tag else ""
 
             # 保证是 float32 Tensor（无论传进来是 list/np/torch）
             bg_positions = torch.as_tensor(bg_positions, dtype=torch.float32)
             normals      = torch.as_tensor(normals,      dtype=torch.float32)
 
             if fmt == "pt":
-                path = out / f"{tgt_name}.pt"
+                path = out / f"{tgt_name}{suffix}.pt"
                 torch.save({"bg_positions": bg_positions.cpu(),
                             "normals": normals.cpu()}, path)
             elif fmt == "npz":
-                path = out / f"{tgt_name}.npz"
-                np.savez_compressed(path,
-                                    bg_positions=bg_positions.cpu().numpy(),
-                                    normals=normals.cpu().numpy())
+                path = out / f"{tgt_name}{suffix}.npz"
+                save_npz_portable(
+                    path,
+                    compressed=True,
+                    bg_positions=bg_positions.cpu().numpy(),
+                    normals=normals.cpu().numpy(),
+                )
             else:
                 raise ValueError("fmt must be 'pt' or 'npz'")
             return str(path)
@@ -2283,13 +2339,20 @@ def main(
           normals_tensor_nksr = torch.from_numpy(normals_np_nksr)
           pointclouds_tensor_nksr = torch.from_numpy(points_np_nksr)
 
-          cache_path = save_bg_normals(tgt_name, pointclouds_tensor_nksr, normals_tensor_nksr, fmt="pt")
+          cache_path = save_bg_normals(
+              tgt_name,
+              pointclouds_tensor_nksr,
+              normals_tensor_nksr,
+              fmt="pt",
+              tag=moge_base_path.name,
+          )
           nksr_input_dir = save_dir / "nksr_input"
           nksr_input_dir.mkdir(parents=True, exist_ok=True)
 
           nksr_npz_path = nksr_input_dir / "pointcloud_world.npz"
-          np.savez_compressed(
+          save_npz_portable(
               nksr_npz_path,
+              compressed=True,
               points=points_np_nksr,
               normals=normals_np_nksr,
               frame_indices=np.asarray(frame_indices, dtype=np.int32),
@@ -2364,6 +2427,7 @@ def main(
                 stat_cam=(static_camera or single_image),
                 detailed_planes=detailed_planes,
                 cluster_dump_dir=cluster_dump_dir,
+                segment_min_frames=segment_min_frames,
             )
 
         '''
@@ -2421,6 +2485,11 @@ def main(
         
         
         # np.save(f"_sqs_params/{tgt_name}.npy", params_np)
+    else:
+        print("[segment] Skipping segmentation/SQ mesh generation")
+        results = {"pts_items": []}
+        params_np = np.empty((0, 11), dtype=np.float32)
+        per_sq_one_list = []
 
 
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -85,6 +87,50 @@ def clean_stale_pieces(pieces_dir: Path, keep_paths: list[Path]) -> list[str]:
     return removed
 
 
+def load_existing_params(sqs_root: Path, expected_count: int) -> np.ndarray | None:
+    for path in (sqs_root / "sqs_params.npz", sqs_root / "sqs_params.npy"):
+        if not path.exists():
+            continue
+        try:
+            if path.suffix == ".npz":
+                with np.load(path, allow_pickle=True) as data:
+                    if "params" not in data.files:
+                        continue
+                    params = np.asarray(data["params"], dtype=np.float32)
+            else:
+                params = np.asarray(np.load(path, allow_pickle=True), dtype=np.float32)
+        except Exception:
+            continue
+        if params.ndim == 2 and params.shape == (expected_count, 11):
+            return params.copy()
+    return None
+
+
+def rotations_from_params(params: np.ndarray) -> np.ndarray:
+    if params.size == 0:
+        return np.zeros((0, 3, 3), dtype=np.float32)
+    return Rotation.from_euler("ZYX", params[:, 5:8]).as_matrix().astype(np.float32)
+
+
+def save_params_payload(sqs_root: Path, params_np: np.ndarray, piece_names: list[str], rot_np: np.ndarray) -> None:
+    np.save(sqs_root / "sqs_params.npy", params_np)
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        np.savez_compressed(
+            tmp_path,
+            params=params_np,
+            piece_name_utf8=np.asarray(piece_names, dtype=f"<U{max((len(name) for name in piece_names), default=1)}"),
+            piece_rot_p2w=rot_np,
+        )
+        shutil.copyfile(tmp_path, sqs_root / "sqs_params.npz")
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def main() -> None:
     args = parse_args()
     scene_root = args.scene_root.resolve()
@@ -102,6 +148,23 @@ def main() -> None:
         raise FileNotFoundError(f"URDF references missing piece files: {missing}")
 
     removed = clean_stale_pieces(pieces_dir, piece_paths)
+
+    existing_params = load_existing_params(sqs_root, len(piece_paths))
+    if existing_params is not None:
+        piece_names = [path.name for path in piece_paths]
+        params_np = existing_params.astype(np.float32, copy=True)
+        rot_np = rotations_from_params(params_np)
+        save_params_payload(sqs_root, params_np, piece_names, rot_np)
+        summary = {
+            "scene_root": str(scene_root),
+            "num_pieces": int(len(piece_paths)),
+            "removed_stale_pieces": removed,
+            "preserved_existing_params": True,
+            "sqs_params_npy": str((sqs_root / "sqs_params.npy").resolve()),
+            "sqs_params_npz": str((sqs_root / "sqs_params.npz").resolve()),
+        }
+        print(json.dumps(summary, indent=2))
+        return
 
     params = []
     rot_mats = []
@@ -142,18 +205,13 @@ def main() -> None:
     params_np = np.asarray(params, dtype=np.float32)
     rot_np = np.stack(rot_mats, axis=0).astype(np.float32) if rot_mats else np.zeros((0, 3, 3), dtype=np.float32)
 
-    np.save(sqs_root / "sqs_params.npy", params_np)
-    np.savez_compressed(
-        sqs_root / "sqs_params.npz",
-        params=params_np,
-        piece_name_utf8=np.asarray(piece_names, dtype=f"<U{max((len(name) for name in piece_names), default=1)}"),
-        piece_rot_p2w=rot_np,
-    )
+    save_params_payload(sqs_root, params_np, piece_names, rot_np)
 
     summary = {
         "scene_root": str(scene_root),
         "num_pieces": int(len(piece_paths)),
         "removed_stale_pieces": removed,
+        "preserved_existing_params": False,
         "sqs_params_npy": str((sqs_root / "sqs_params.npy").resolve()),
         "sqs_params_npz": str((sqs_root / "sqs_params.npz").resolve()),
     }

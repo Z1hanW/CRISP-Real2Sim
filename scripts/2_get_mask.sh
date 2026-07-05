@@ -12,10 +12,16 @@ cd ../prep/AutoMask
 #   5) Run the Python script in parallel on each GPU.
 
 DATA_PATH="${1}_img"
+OBJECT_MASK_PROMPT="${OBJECT_MASK_PROMPT:-}"
 
 
-# Count how many GPUs you have
-GPU_COUNT=$(nvidia-smi -L | wc -l)
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    IFS=',' read -r -a GPU_IDS <<< "$CUDA_VISIBLE_DEVICES"
+else
+    GPU_COUNT=$(nvidia-smi -L | wc -l)
+    GPU_IDS=($(seq 0 $((GPU_COUNT-1))))
+fi
+GPU_COUNT=${#GPU_IDS[@]}
 
 # Gather all subdirectories (one level deep) under DATA_PATH
 folders=($(find "$DATA_PATH" -maxdepth 1 -mindepth 1 -type d))
@@ -29,7 +35,7 @@ for i in "${!folders[@]}"; do
     seq=$(basename "$folder")
     
     # Round-robin assignment of GPU by index modulo GPU_COUNT
-    GPU_ID=$(( i % GPU_COUNT ))
+    GPU_ID="${GPU_IDS[$(( i % GPU_COUNT ))]}"
     
     echo "Launching job for '$folder' on GPU $GPU_ID ..."
 
@@ -43,7 +49,15 @@ for i in "${!folders[@]}"; do
         --video_dir "$DATA_PATH" \
         --save_dir "$SAVE_PATH" &
 
-    if [[ "$DATA_PATH" == *door* ]]; then
+    if [[ -n "$OBJECT_MASK_PROMPT" && "$OBJECT_MASK_PROMPT" != "person" ]]; then
+        echo "OBJECT_MASK_PROMPT=$OBJECT_MASK_PROMPT for $seq on GPU $GPU_ID ..."
+        CUDA_VISIBLE_DEVICES=$GPU_ID \
+          python custom_mask.py \
+            --seq "$seq" \
+            --text_prompt "$OBJECT_MASK_PROMPT" \
+            --video_dir "$DATA_PATH" \
+            --save_dir "$SAVE_PATH" &
+    elif [[ "$DATA_PATH" == *door* ]]; then
         echo "'door' found in DATA_PATH: $DATA_PATH. Running twice..."
         CUDA_VISIBLE_DEVICES=$GPU_ID \
           python custom_mask.py \
@@ -51,10 +65,8 @@ for i in "${!folders[@]}"; do
             --text_prompt "door" \
             --video_dir "$DATA_PATH" \
             --save_dir "$SAVE_PATH" &
-    fi
-
-    if [[ "$DATA_PATH" == *box* ]]; then
-        echo "'door' found in DATA_PATH: $DATA_PATH. Running twice..."
+    elif [[ "$DATA_PATH" == *box* ]]; then
+        echo "'box' found in DATA_PATH: $DATA_PATH. Running twice..."
         CUDA_VISIBLE_DEVICES=$GPU_ID \
           python custom_mask.py \
             --seq "$seq" \

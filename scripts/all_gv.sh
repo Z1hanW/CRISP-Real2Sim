@@ -14,7 +14,7 @@ HMR_TYPE="gv"
 
 bash 1_video2imgs.sh "$ROOT_DIR"
 bash 2_get_mask.sh "$ROOT_DIR"
-bash 3_megasam.sh "$ROOT_DIR" 
+bash 3_scene_reconstruction.sh "$ROOT_DIR"
 bash 4_post_camera.sh "$ROOT_DIR"
 bash 5_grav.sh "$ROOT_DIR"
 bash 0_ufm.sh "$ROOT_DIR"

@@ -18,6 +18,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence-name", type=str, required=True)
     parser.add_argument("--hmr-type", type=str, default="gv")
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument(
+        "--input-root",
+        type=Path,
+        default=None,
+        help="Root containing <sequence>/<hmr-type>/scene_mesh_sqs. Defaults to results/output/scene.",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="Root containing <sequence>/<hmr-type>/world_rotation.npy and destination scene_mesh_sqs. Defaults to results/output/post_scene.",
+    )
     return parser.parse_args()
 
 
@@ -80,8 +92,15 @@ def main() -> None:
     seq = args.sequence_name
     hmr_type = args.hmr_type
 
-    scene_root = repo_root / "results" / "output" / "scene" / seq / hmr_type
-    post_root = repo_root / "results" / "output" / "post_scene" / seq / hmr_type
+    input_root = args.input_root or (repo_root / "results" / "output" / "scene")
+    output_root = args.output_root or (repo_root / "results" / "output" / "post_scene")
+    if not input_root.is_absolute():
+        input_root = repo_root / input_root
+    if not output_root.is_absolute():
+        output_root = repo_root / output_root
+
+    scene_root = input_root / seq / hmr_type
+    post_root = output_root / seq / hmr_type
     sqs_src_root = scene_root / "scene_mesh_sqs"
     sqs_dst_root = post_root / "scene_mesh_sqs"
     if not sqs_src_root.exists():
@@ -119,12 +138,18 @@ def main() -> None:
     pieces_dst.mkdir(parents=True, exist_ok=True)
     rotated_piece_count = 0
     for ref in piece_refs:
-        src = pieces_src / ref
-        if not src.exists():
+        ref_path = Path(ref)
+        candidates = []
+        if ref_path.is_absolute():
+            candidates.append(ref_path)
+        else:
+            candidates.extend([sqs_src_root / ref_path, pieces_src / ref_path, pieces_src / ref_path.name])
+        src = next((path for path in candidates if path.exists()), None)
+        if src is None:
             continue
         lines, vertices = load_obj(src)
         rotated = rotate_vertices_rowvec(vertices, rotation, shared_translation)
-        write_obj(pieces_dst / ref, lines, rotated)
+        write_obj(pieces_dst / ref_path.name, lines, rotated)
         rotated_piece_count += 1
 
     if params_src.suffix == ".npz":

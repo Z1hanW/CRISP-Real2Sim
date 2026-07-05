@@ -544,7 +544,9 @@ def process_gv_smpl(
     max_frames: int,
     smpl_model = None, # legacy. 
     use_world: bool = True,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    frame_indices: Optional[Union[np.ndarray, torch.Tensor, List[int]]] = None,
+    hmr_results_root: Optional[Union[str, Path]] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Process SMPL data from GV (GVHMR) format.
@@ -557,14 +559,71 @@ def process_gv_smpl(
         smpl_model: SMPL model instance (not used directly, but kept for consistency)
         use_world: Whether to transform to world coordinates
         device: Device to run computations on
+        frame_indices: Optional source-frame indices used when scene reconstruction
+            is a cropped or sampled subset of a longer HMR sequence.
+        hmr_results_root: Optional root containing <tgt_name>/hmr4d_results.pt.
         
     Returns:
         Dictionary containing processed SMPL data
     """
     from smpl import BodyModelSMPLX, BodyModelSMPLH
     
-    hmr4d_path = HMR_RESULTS_ROOT / tgt_name / "hmr4d_results.pt"
+    hmr_root = Path(hmr_results_root).expanduser() if hmr_results_root is not None else HMR_RESULTS_ROOT
+    hmr4d_path = hmr_root / tgt_name / "hmr4d_results.pt"
     pred = torch.load(hmr4d_path)
+
+    def _infer_frame_count(value) -> Optional[int]:
+        if torch.is_tensor(value) or isinstance(value, np.ndarray):
+            return int(value.shape[0]) if value.ndim > 0 else None
+        if isinstance(value, dict):
+            for child in value.values():
+                count = _infer_frame_count(child)
+                if count is not None:
+                    return count
+        return None
+
+    def _take_frames(value, indices_np: np.ndarray):
+        if torch.is_tensor(value):
+            if value.ndim == 0:
+                return value
+            idx = torch.as_tensor(indices_np, dtype=torch.long, device=value.device)
+            return value.index_select(0, idx)
+        if isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                return value
+            return value[indices_np]
+        if isinstance(value, dict):
+            return {k: _take_frames(v, indices_np) for k, v in value.items()}
+        return value
+
+    scene_frame_count = min(int(max_frames), int(len(world_cam_R)), int(len(world_cam_T)))
+    raw_frame_count = _infer_frame_count(pred["smpl_params_incam"])
+    if raw_frame_count is None:
+        raise ValueError(f"Could not infer GVHMR frame count for {tgt_name}")
+
+    if frame_indices is not None:
+        indices_np = np.asarray(frame_indices, dtype=np.int64).reshape(-1)[:scene_frame_count]
+        if indices_np.size == 0:
+            raise ValueError(f"Empty frame_indices for {tgt_name}")
+        if int(indices_np.min()) < 0 or int(indices_np.max()) >= raw_frame_count:
+            raise IndexError(
+                f"GVHMR frame indices out of range for {tgt_name}: "
+                f"min={int(indices_np.min())}, max={int(indices_np.max())}, "
+                f"hmr_frames={raw_frame_count}"
+            )
+    else:
+        indices_np = np.arange(min(scene_frame_count, raw_frame_count), dtype=np.int64)
+        if raw_frame_count != scene_frame_count:
+            print(
+                f"[process_gv_smpl] frame count mismatch for {tgt_name}: "
+                f"scene={scene_frame_count}, hmr={raw_frame_count}; using first {len(indices_np)} frames"
+            )
+
+    pred_smpl_incam = _take_frames(pred["smpl_params_incam"], indices_np)
+    num_frames = min(scene_frame_count, len(indices_np))
+    pred_smpl_incam = _take_frames(pred_smpl_incam, np.arange(num_frames, dtype=np.int64))
+    world_cam_R = world_cam_R[:num_frames]
+    world_cam_T = world_cam_T[:num_frames]
     
     PROJ_ROOT = GVHMR_ROOT
     smplx2smpl = torch.load(GVHMR_UTILS_DIR / "body_model" / "smplx2smpl_sparse.pt").to(device)
@@ -596,10 +655,8 @@ def process_gv_smpl(
     model_ = BodyModelSMPLH(**bm_kwargs_smpl)
     faces = model_.faces
     
-    num_frames = min(max_frames, len(world_cam_R))
-    
     # Process SMPL-X output
-    smplx_out = modelggg(**to_cuda(pred["smpl_params_incam"])) # torch.Size([224, 127, 3])
+    smplx_out = modelggg(**to_cuda(pred_smpl_incam)) # torch.Size([224, 127, 3])
     # print(smplx_out.joints.shape, smplx_out.vertices.shape, 'thaishfaisfhaisfhas')
     
     pred_c_verts = convert_smplx_to_smpl(smplx_out.vertices, smplx2smpl)
@@ -616,7 +673,7 @@ def process_gv_smpl(
     rotmats_smpl = torch.cat([rotmats, identity_rot], dim=1)
     body_pose = rotmats_smpl
     
-    transl_cam = pred["smpl_params_incam"]['transl']
+    transl_cam = pred_smpl_incam['transl']
     transl_cam = transl_cam.unsqueeze(1).to(device)
     
     if use_world:
@@ -630,7 +687,7 @@ def process_gv_smpl(
         pred_vert = torch.einsum('bij,bnj->bni', world_cam_R, pred_c_verts) + world_cam_T[:, None]
         
         # Adjust translation to align vertices properly
-        pred_smpl_world = copy.deepcopy(pred["smpl_params_incam"])
+        pred_smpl_world = copy.deepcopy(pred_smpl_incam)
         pred_smpl_world['transl'] = transl_world.squeeze(1)
         pred_smpl_world['global_orient'] = global_orient_world
         
