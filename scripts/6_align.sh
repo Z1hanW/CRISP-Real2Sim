@@ -17,6 +17,9 @@ if [[ "$ROOT" == *_img ]]; then
 else
   DATA_PATH="${ROOT}_img"
 fi
+if [[ "$DATA_PATH" != /* ]]; then
+  DATA_PATH="$REPO_ROOT/$DATA_PATH"
+fi
 
 BACKEND_RAW="${SCENE_RECON_BACKEND:-megasam}"
 BACKEND_RAW="${BACKEND_RAW,,}"
@@ -44,7 +47,13 @@ POST_PROCESS_SCRIPT="${POST_PROCESS_SCRIPT:-post_process.py}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 OBJ_MASK_NAME="${OBJ_MASK_NAME:-}"
 OBJ_MESH="${OBJ_MESH:-}"
-HMR_ROOT="${HMR_ROOT:-$DEFAULT_HMR_ROOT}"
+if [[ -n "${HMR_ROOT:-}" ]]; then
+  HMR_ROOT="$HMR_ROOT"
+elif [[ "$BACKEND" == "vggt_omega" && ! -d "$DEFAULT_HMR_ROOT" && -d "$REPO_ROOT/results/init/hmr" ]]; then
+  HMR_ROOT="$REPO_ROOT/results/init/hmr"
+else
+  HMR_ROOT="$DEFAULT_HMR_ROOT"
+fi
 
 if [[ ! -d "$DATA_PATH" ]]; then
   echo "[6_align] missing data directory: $DATA_PATH" >&2
@@ -52,6 +61,11 @@ if [[ ! -d "$DATA_PATH" ]]; then
 fi
 
 pushd "$REPO_ROOT/prep/MogeSAM" >/dev/null
+
+POST_PROCESS_SUPPORTS_OUTPUT_PATH=0
+if "$PYTHON_BIN" "$POST_PROCESS_SCRIPT" --help 2>&1 | grep -q -- "--output_path"; then
+  POST_PROCESS_SUPPORTS_OUTPUT_PATH=1
+fi
 
 shopt -s nullglob
 seq_dirs=("$DATA_PATH"/*/)
@@ -99,7 +113,45 @@ for folder in "${seq_dirs[@]}"; do
   fi
 
   echo "[6_align] ${seq} -> ${output_path}"
-  "${cmd[@]}"
+  if (( POST_PROCESS_SUPPORTS_OUTPUT_PATH == 1 )); then
+    "${cmd[@]}"
+  else
+    legacy_output="$SCENE_OUTPUT_DIR/${seq}_${HMR_TYPE}_sgd_cvd_hr.npz"
+    backup_path=""
+    if [[ "$legacy_output" != "$output_path" && -e "$legacy_output" ]]; then
+      backup_path="$(mktemp "$SCENE_OUTPUT_DIR/.${seq}_${HMR_TYPE}_legacy_backup.XXXXXX")"
+      cp -p "$legacy_output" "$backup_path"
+    fi
+
+    legacy_cmd=(
+      "$PYTHON_BIN" "$POST_PROCESS_SCRIPT"
+      --output_dir "$SCENE_RAW_PRIORS_ROOT"
+      --method sgd_cvd_hr
+      --hmr_type "$HMR_TYPE"
+      --scene_name "$seq"
+    )
+
+    if ! "${legacy_cmd[@]}"; then
+      if [[ -n "$backup_path" ]]; then
+        mv -f "$backup_path" "$legacy_output"
+      fi
+      exit 1
+    fi
+
+    if [[ "$legacy_output" != "$output_path" ]]; then
+      if [[ ! -s "$legacy_output" ]]; then
+        if [[ -n "$backup_path" ]]; then
+          mv -f "$backup_path" "$legacy_output"
+        fi
+        echo "[6_align] legacy post_process did not produce $legacy_output" >&2
+        exit 1
+      fi
+      mv -f "$legacy_output" "$output_path"
+      if [[ -n "$backup_path" ]]; then
+        mv -f "$backup_path" "$legacy_output"
+      fi
+    fi
+  fi
 done
 
 popd >/dev/null

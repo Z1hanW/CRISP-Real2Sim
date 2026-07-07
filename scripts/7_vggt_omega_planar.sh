@@ -25,7 +25,15 @@ export SCENE_PRIOR_BASE_PATH="${SCENE_PRIOR_BASE_PATH:-$REPO_ROOT/results/init/v
 export SCENE_CAMERA_ROOT="${SCENE_CAMERA_ROOT:-$REPO_ROOT/results/init/vslam/vggt_omega_cam}"
 export SCENE_ARTIFACT_OUTPUT_DIR="${SCENE_ARTIFACT_OUTPUT_DIR:-$REPO_ROOT/results/output/scene_vggt_omega_consistent_camera_min1}"
 export SCENE_NPZ_DIR="${SCENE_NPZ_DIR:-$REPO_ROOT/results/output/scene}"
-export HMR_RESULTS_ROOT="${HMR_RESULTS_ROOT:-$REPO_ROOT/results/init/hmr_vggt_omega}"
+if [[ -z "${HMR_RESULTS_ROOT:-}" ]]; then
+  if [[ -d "$REPO_ROOT/results/init/hmr_vggt_omega" ]]; then
+    export HMR_RESULTS_ROOT="$REPO_ROOT/results/init/hmr_vggt_omega"
+  else
+    export HMR_RESULTS_ROOT="$REPO_ROOT/results/init/hmr"
+  fi
+else
+  export HMR_RESULTS_ROOT
+fi
 export LOG_DIR="${LOG_DIR:-/tmp/vis_vggt_omega_planar_logs}"
 export PYTHON_BIN="${PYTHON_BIN:-/home/ubuntu/miniconda3/envs/crisp/bin/python}"
 export SAVE_CLUSTERING="${SAVE_CLUSTERING:-on}"

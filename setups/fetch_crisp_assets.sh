@@ -57,6 +57,13 @@ fi
 cp -f \
     "$ROOT/prep/HMR/inputs/checkpoints/body_models/smpl/SMPL_NEUTRAL.pkl" \
     "$ROOT/prep/data/smpl/SMPL_NEUTRAL.pkl"
+if [[ -f "$ROOT/prep/data/smpl/J_regressor_extra.npy" ]]; then
+    cp -f \
+        "$ROOT/prep/data/smpl/J_regressor_extra.npy" \
+        "$ROOT/prep/HMR/inputs/checkpoints/body_models/smpl/J_regressor_extra.npy"
+else
+    echo "Warning: prep/data/smpl/J_regressor_extra.npy not found; postprocess SMPL helpers may fail until it is staged."
+fi
 
 echo "[5/7] fetch torch hub repos"
 if [[ ! -d "$TORCH_HUB_DIR/facebookresearch_co-tracker_main/.git" ]]; then

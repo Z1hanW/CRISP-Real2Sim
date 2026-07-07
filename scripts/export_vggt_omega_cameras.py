@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 from pathlib import Path
 
 import cv2
@@ -113,21 +114,25 @@ def main() -> int:
     video_root = Path(f"{str(args.split_root).rstrip('/')}_videos")
     if not video_root.is_dir():
         raise FileNotFoundError(video_root)
-    raw_paths = sorted(args.raw_priors_root.glob(args.pattern))
-    if not raw_paths:
-        raise FileNotFoundError(f"No raw priors matching {args.pattern} under {args.raw_priors_root}")
+    video_paths = []
+    for video_path in sorted(video_root.glob("*.mp4")):
+        raw_name = f"{video_path.stem}.npz"
+        if fnmatch.fnmatch(raw_name, args.pattern):
+            video_paths.append(video_path)
+    if not video_paths:
+        raise FileNotFoundError(f"No videos under {video_root} matching raw-prior pattern {args.pattern}")
 
     missing: list[str] = []
-    for raw_path in raw_paths:
-        video_path = video_root / f"{raw_path.stem}.mp4"
-        if not video_path.is_file():
-            missing.append(video_path.name)
+    for video_path in video_paths:
+        raw_path = args.raw_priors_root / f"{video_path.stem}.npz"
+        if not raw_path.is_file():
+            missing.append(raw_path.name)
             continue
         export_one(raw_path, video_path, args.camera_output_root)
 
     if missing:
         preview = ", ".join(missing[:10])
-        raise FileNotFoundError(f"Missing {len(missing)} videos under {video_root}; first: {preview}")
+        raise FileNotFoundError(f"Missing {len(missing)} raw priors under {args.raw_priors_root}; first: {preview}")
     return 0
 
 

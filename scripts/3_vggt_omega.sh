@@ -27,8 +27,14 @@ ENABLE_ALIGNMENT="${VGGT_OMEGA_ENABLE_ALIGNMENT:-0}"
 RAW_PRIORS_ROOT="${VGGT_OMEGA_RAW_PRIORS_ROOT:-$REPO_ROOT/results/init/vslam/raw_vggt_omega_priors}"
 
 if [[ -z "$CHECKPOINT" ]]; then
-  echo "[vggt_omega] VGGT_OMEGA_CHECKPOINT is required." >&2
-  echo "[vggt_omega] Request/download a VGGT-Omega checkpoint, then export VGGT_OMEGA_CHECKPOINT=/path/to/model.pt" >&2
+  echo "[vggt_omega] ERROR: VGGT_OMEGA_CHECKPOINT is required." >&2
+  echo "[vggt_omega] ERROR: request access at https://huggingface.co/facebook/VGGT-Omega, then download the checkpoint and export VGGT_OMEGA_CHECKPOINT=/path/to/model.pt" >&2
+  exit 2
+fi
+
+if [[ ! -f "$CHECKPOINT" ]]; then
+  echo "[vggt_omega] ERROR: VGGT_OMEGA_CHECKPOINT does not point to a file: $CHECKPOINT" >&2
+  echo "[vggt_omega] ERROR: VGGT-Omega checkpoints are gated; request access at https://huggingface.co/facebook/VGGT-Omega and download the approved checkpoint first." >&2
   exit 2
 fi
 

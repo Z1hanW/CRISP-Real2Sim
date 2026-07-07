@@ -158,8 +158,9 @@ def run(args: argparse.Namespace) -> Path:
     from vggt_omega.utils.load_fn import load_and_preprocess_images
     from vggt_omega.utils.pose_enc import encoding_to_camera
 
-    input_path = args.input_path.expanduser().resolve()
-    seq_name = _sequence_name(input_path, args.sequence_name)
+    input_arg_path = args.input_path.expanduser()
+    seq_name = _sequence_name(input_arg_path, args.sequence_name)
+    input_path = input_arg_path.resolve()
     output_path = args.output_path
     if output_path is None:
         output_path = args.raw_priors_root / f"{seq_name}.npz"

@@ -73,15 +73,35 @@ bash run_crisp_video.sh /path/to/data/demo        # not /path/to/data/demo_video
 ```
 
 For the `v2-by VGGT omega` path, initialize the `prep/vggt-omega` submodule,
-set `SCENE_RECON_BACKEND=vggt_omega`, and point CRISP at the local checkpoint:
+set `SCENE_RECON_BACKEND=vggt_omega`, and point CRISP at the local checkpoint.
+The VGGT-Omega checkpoints are gated Hugging Face files: request access at
+https://huggingface.co/facebook/VGGT-Omega first, wait for approval, then
+authenticate locally and download the checkpoint outside the repo. Do not commit
+Hugging Face tokens or write them into scripts.
 
 ```bash
 bash scripts/manage_submodules.sh init
+huggingface-cli login
+mkdir -p /path/to/models/vggt-omega
+huggingface-cli download facebook/VGGT-Omega vggt_omega_1b_512.pt \
+  --local-dir /path/to/models/vggt-omega
+
 export SCENE_RECON_BACKEND=vggt_omega
 export VGGT_OMEGA_REPO="$PWD/prep/vggt-omega"
-export VGGT_OMEGA_CHECKPOINT=/path/to/VGGT-Omega-1B-512/model.pt
+export VGGT_OMEGA_CHECKPOINT=/path/to/models/vggt-omega/vggt_omega_1b_512.pt
 bash run_crisp_video.sh /path/to/data/demo
 ```
+
+If this setup is not correct, the VGGT step stops early with an error like:
+
+```text
+[vggt_omega] ERROR: VGGT_OMEGA_CHECKPOINT is required.
+[vggt_omega] ERROR: request access at https://huggingface.co/facebook/VGGT-Omega, then download the checkpoint and export VGGT_OMEGA_CHECKPOINT=/path/to/model.pt
+```
+
+For Hugging Face 401/403 errors, confirm that the account used by
+`huggingface-cli login` has already been approved for the gated
+`facebook/VGGT-Omega` repo.
 
 The VGGT-Omega adapter writes the same CRISP raw camera/depth prior file used by
 the rest of the pipeline:

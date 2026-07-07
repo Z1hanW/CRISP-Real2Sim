@@ -9,6 +9,8 @@ HMR_TYPE="${HMR_TYPE:-gv}"
 SCENE_ARTIFACT_OUTPUT_DIR="${SCENE_ARTIFACT_OUTPUT_DIR:-$REPO_ROOT/results/output/scene_vggt_omega_consistent_camera_min1}"
 POST_SCENE_OUTPUT_DIR="${POST_SCENE_OUTPUT_DIR:-$REPO_ROOT/results/output/post_scene_vggt_omega}"
 DATA_ROOT="${DATA_ROOT:-$REPO_ROOT/data}"
+POST_SEQ_ROOT="${POST_SEQ_ROOT:-}"
+POST_SEQS="${POST_SEQS:-}"
 SCENE_NPZ_TEMPLATE="${SCENE_NPZ_TEMPLATE:-}"
 LOG_DIR="${LOG_DIR:-/tmp/stairs_vggt_omega_postprocess}"
 POST_JOBS="${POST_JOBS:-2}"
@@ -18,6 +20,14 @@ ROT_BABY_EXTRA_ARGS="${ROT_BABY_EXTRA_ARGS:---debug-stride 1000000 --no-optimize
 
 if [[ -z "$SCENE_NPZ_TEMPLATE" ]]; then
   SCENE_NPZ_TEMPLATE="$REPO_ROOT/results/output/scene/{seq}_vggt_omega_${HMR_TYPE}_sgd_cvd_hr.npz"
+fi
+
+if [[ -z "$POST_SEQS" && -n "$POST_SEQ_ROOT" ]]; then
+  seq_root_check="${POST_SEQ_ROOT%/}"
+  if [[ ! -d "${seq_root_check}_videos" && ! -d "${seq_root_check}_img" ]]; then
+    echo "[postprocess] POST_SEQ_ROOT did not resolve to ${seq_root_check}_videos or ${seq_root_check}_img" >&2
+    exit 2
+  fi
 fi
 
 mkdir -p "$LOG_DIR" "$POST_SCENE_OUTPUT_DIR"
@@ -85,6 +95,61 @@ mapfile -t SEQS < <(
     | xargs -r -n1 basename \
     | sort
 )
+
+filter_requested_sequences() {
+  local requested=()
+  local seq_root="${POST_SEQ_ROOT%/}"
+
+  if [[ -n "$POST_SEQS" ]]; then
+    local raw_seq
+    IFS=',' read -r -a requested <<<"$POST_SEQS"
+    for raw_seq in "${requested[@]}"; do
+      [[ -n "$raw_seq" ]] || continue
+      printf '%s\n' "$raw_seq"
+    done | sort -u
+    return
+  fi
+
+  if [[ -n "$seq_root" ]]; then
+    local video_root="${seq_root}_videos"
+    local img_root="${seq_root}_img"
+    if [[ -d "$video_root" ]]; then
+      find -L "$video_root" -maxdepth 1 -type f -name "*.mp4" -printf '%f\n' \
+        | sed 's/\.mp4$//' \
+        | sort -u
+      return
+    fi
+    if [[ -d "$img_root" ]]; then
+      find "$img_root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort -u
+      return
+    fi
+  fi
+}
+
+mapfile -t REQUESTED_SEQS < <(filter_requested_sequences)
+
+if (( ${#REQUESTED_SEQS[@]} > 0 )); then
+  declare -A available=()
+  for seq in "${SEQS[@]}"; do
+    available["$seq"]=1
+  done
+
+  filtered=()
+  missing=()
+  for seq in "${REQUESTED_SEQS[@]}"; do
+    if [[ -n "${available[$seq]:-}" ]]; then
+      filtered+=("$seq")
+    else
+      missing+=("$seq")
+    fi
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    echo "[postprocess] missing scene artifacts for requested sequences: ${missing[*]}" >&2
+    exit 2
+  fi
+  SEQS=("${filtered[@]}")
+fi
 
 if (( ${#SEQS[@]} == 0 )); then
   echo "[postprocess] no sequences found under $SCENE_ARTIFACT_OUTPUT_DIR" >&2

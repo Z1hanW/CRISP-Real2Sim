@@ -42,11 +42,13 @@ case "$BACKEND_RAW" in
     BACKEND="megasam"
     DEFAULT_PRIORS_ROOT="$REPO_ROOT/results/init/vslam/raw_mega_priors"
     DEFAULT_ARTIFACT_OUTPUT_DIR="$REPO_ROOT/results/output/scene"
+    DEFAULT_CAMERA_ROOT=""
     ;;
   vggt_omega|vggt-omega|vggt)
     BACKEND="vggt_omega"
     DEFAULT_PRIORS_ROOT="$REPO_ROOT/results/init/vslam/raw_vggt_omega_priors"
     DEFAULT_ARTIFACT_OUTPUT_DIR="$REPO_ROOT/results/output/scene_vggt_omega_consistent_camera_min1"
+    DEFAULT_CAMERA_ROOT="$REPO_ROOT/results/init/vslam/vggt_omega_cam"
     ;;
   *)
     echo "Unknown SCENE_RECON_BACKEND='$SCENE_RECON_BACKEND'" >&2
@@ -54,7 +56,7 @@ case "$BACKEND_RAW" in
     ;;
 esac
 SCENE_PRIOR_BASE_PATH="${SCENE_PRIOR_BASE_PATH:-$DEFAULT_PRIORS_ROOT}"
-SCENE_CAMERA_ROOT="${SCENE_CAMERA_ROOT:-}"
+SCENE_CAMERA_ROOT="${SCENE_CAMERA_ROOT:-$DEFAULT_CAMERA_ROOT}"
 SCENE_ARTIFACT_OUTPUT_DIR="${SCENE_ARTIFACT_OUTPUT_DIR:-$DEFAULT_ARTIFACT_OUTPUT_DIR}"
 SCENE_NPZ_DIR="${SCENE_NPZ_DIR:-$REPO_ROOT/results/output/scene}"
 HMR_RESULTS_ROOT="${HMR_RESULTS_ROOT:-$REPO_ROOT/results/init/hmr}"

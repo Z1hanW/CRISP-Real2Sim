@@ -64,6 +64,11 @@ cp "$SMPL_DIR/smpl/models/basicmodel_m_lbs_10_207_0_v1.0.0.pkl" HMR/inputs/check
 
 mv "$SMPLIFY_EXTRACT_DIR/smplify_public/code/models/basicModel_neutral_lbs_10_207_0_v1.0.0.pkl" "$SMPL_DIR/SMPL_NEUTRAL.pkl"
 cp "$SMPL_DIR/SMPL_NEUTRAL.pkl" HMR/inputs/checkpoints/body_models/smpl/SMPL_NEUTRAL.pkl
+if [[ -f "$SMPL_DIR/J_regressor_extra.npy" ]]; then
+    cp "$SMPL_DIR/J_regressor_extra.npy" HMR/inputs/checkpoints/body_models/smpl/J_regressor_extra.npy
+else
+    echo "Warning: $SMPL_DIR/J_regressor_extra.npy not found; postprocess SMPL helpers may fail until it is staged."
+fi
 rm -rf "$SMPLIFY_EXTRACT_DIR"
 
 cp "$SMPLX_DIR/models/smplx/SMPLX_FEMALE.npz" HMR/inputs/checkpoints/body_models/smplx/SMPLX_FEMALE.npz

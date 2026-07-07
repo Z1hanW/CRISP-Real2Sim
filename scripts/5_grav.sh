@@ -34,6 +34,7 @@ for GPU_ID in "${GPU_IDS[@]}"; do
 done
 
 # Distribute videos across GPUs
+pids=()
 for ((i=0; i < TOTAL_FILES; i++)); do
     # Identify the GPU with the fewest tasks
     MIN_GPU=$(for GPU_ID in "${GPU_IDS[@]}"; do echo "$GPU_ID ${GPU_TASKS[$GPU_ID]}"; done \
@@ -45,6 +46,7 @@ for ((i=0; i < TOTAL_FILES; i++)); do
 
     # Run the job in the background
     process_video "$video_file" "$MIN_GPU" &
+    pids+=("$!")
 
     # Update the task count
     GPU_TASKS[$MIN_GPU]=$((GPU_TASKS[$MIN_GPU] + 1))
@@ -54,5 +56,14 @@ for ((i=0; i < TOTAL_FILES; i++)); do
 done
 
 # Wait for all background jobs
-wait
+status=0
+for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+        status=1
+    fi
+done
+if (( status != 0 )); then
+    echo "One or more HMR jobs failed." >&2
+    exit "$status"
+fi
 echo "All processing complete."
