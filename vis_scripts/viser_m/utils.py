@@ -3934,6 +3934,108 @@ def find_segment_correspondences_improved(
 
 
 
+def _save_agentic_per_frame_evidence(
+    save_dir: Path,
+    all_seg_maps: List[np.ndarray],
+    all_frame_segments: List[Dict[int, Dict]],
+    global_segments: Dict[int, List[Tuple[int, int]]],
+    frame_indices: List[int],
+    max_preview_frames: int = 16,
+) -> None:
+    """Save machine-readable per-frame segments and compact visual previews."""
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    segment_maps = np.stack(all_seg_maps).astype(np.int32, copy=False)
+    np.savez_compressed(
+        save_dir / "per_frame_segments.npz",
+        segment_maps=segment_maps,
+        frame_indices=np.asarray(frame_indices, dtype=np.int32),
+    )
+
+    global_lookup = {
+        (int(frame_pos), int(local_id)): int(global_id)
+        for global_id, members in global_segments.items()
+        for frame_pos, local_id in members
+    }
+    frames_payload = []
+    for frame_pos, (frame_idx, props_by_id) in enumerate(zip(frame_indices, all_frame_segments)):
+        segments = []
+        for local_id, props in sorted(props_by_id.items()):
+            pixels = np.asarray(props["pixels"], dtype=np.int32)
+            if pixels.size:
+                y0, x0 = pixels.min(axis=0)
+                y1, x1 = pixels.max(axis=0)
+                bbox_xyxy = [int(x0), int(y0), int(x1), int(y1)]
+            else:
+                bbox_xyxy = [0, 0, 0, 0]
+            segments.append(
+                {
+                    "local_id": int(local_id),
+                    "global_id": global_lookup.get((frame_pos, int(local_id))),
+                    "pixel_count": int(len(props["pixels"])),
+                    "point_count": int(props["world_points"].shape[0]),
+                    "bbox_xyxy": bbox_xyxy,
+                    "normal": props["avg_normal"].detach().cpu().tolist(),
+                    "centroid": props["centroid"].detach().cpu().tolist(),
+                }
+            )
+        frames_payload.append(
+            {
+                "frame_position": int(frame_pos),
+                "frame_index": int(frame_idx),
+                "segments": segments,
+            }
+        )
+
+    summary = {
+        "schema_version": 1,
+        "frame_count": len(frame_indices),
+        "global_segment_count": len(global_segments),
+        "frames": frames_payload,
+        "global_segments": {
+            str(global_id): [
+                {"frame_position": int(frame_pos), "local_id": int(local_id)}
+                for frame_pos, local_id in members
+            ]
+            for global_id, members in global_segments.items()
+        },
+    }
+    (save_dir / "segments.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    preview_count = min(max_preview_frames, len(frame_indices))
+    preview_positions = np.unique(
+        np.linspace(0, len(frame_indices) - 1, preview_count, dtype=np.int32)
+    )
+    preview_files = []
+    for frame_pos in preview_positions:
+        seg_map = all_seg_maps[int(frame_pos)]
+        rgb = np.zeros((*seg_map.shape, 3), dtype=np.uint8)
+        for local_id in np.unique(seg_map):
+            if local_id < 0:
+                continue
+            global_id = global_lookup.get((int(frame_pos), int(local_id)), int(local_id))
+            hue = (global_id * 0.618033988749895) % 1.0
+            color = np.asarray(
+                colors.hsv_to_rgb([hue, 0.72, 0.95]) * 255.0,
+                dtype=np.uint8,
+            )
+            rgb[seg_map == local_id] = color
+        frame_idx = int(frame_indices[int(frame_pos)])
+        filename = f"frame_{frame_idx:06d}_clusters.png"
+        cv2.imwrite(str(save_dir / filename), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        preview_files.append(filename)
+
+    manifest = {
+        "schema_version": 1,
+        "segment_maps": "per_frame_segments.npz",
+        "segment_summary": "segments.json",
+        "preview_files": preview_files,
+    }
+    (save_dir / "evidence_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[agentic-evidence] saved per-frame clustering to {save_dir}")
+
+
 def interval_flow_segmentation_pipeline_with_vis(
     mono_normals: torch.Tensor,  # (T, H, W, 3)
     depthmaps: torch.Tensor,     # (T, H, W)
@@ -4026,6 +4128,16 @@ def interval_flow_segmentation_pipeline_with_vis(
     )
     print(f"  ↳ {len(global_segments)} global segments after greedy fusion")
     print(f"  Found {len(global_segments)} global segments")
+
+    cluster_dump_dir = kwargs.get("cluster_dump_dir")
+    if cluster_dump_dir is not None:
+        _save_agentic_per_frame_evidence(
+            Path(cluster_dump_dir),
+            all_seg_maps,
+            all_frame_segments,
+            global_segments,
+            frame_indices,
+        )
     
     # Save debug visualizations if requested
     if save_debug:

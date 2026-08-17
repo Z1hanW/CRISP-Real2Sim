@@ -1,0 +1,40 @@
+diff --git a/ufm.py b/ufm.py
+index bf8aa53..b1cf8ec 100644
+--- a/ufm.py
++++ b/ufm.py
+@@ -80,2 +80,3 @@ def save_vis(source_image, target_image, i, j, flow_output, covisibility, output
+     fig_path = output_dir_vis / f"ufm_output_{i}_{j}.png"
+-    plt.savefig(fig_path)
++    fig.savefig(fig_path)
++    plt.close(fig)
+@@ -92,6 +93,7 @@ def default_out_dir(inp: str) -> Path:
+-def save_pair(out_dir: Path, src_path: Path, tgt_path: Path, flow, cov, src_rgb, tgt_rgb):
++def save_pair(out_dir: Path, src_path: Path, tgt_path: Path, flow, cov, src_rgb, tgt_rgb, save_visualization=False):
+     i_id = int(src_path.stem)
+     j_id = int(tgt_path.stem)
+-    save_vis(src_rgb, tgt_rgb, i_id, j_id, flow, cov, out_dir)
++    if save_visualization:
++        save_vis(src_rgb, tgt_rgb, i_id, j_id, flow, cov, out_dir)
+     np.save(out_dir / f"flow_{i_id:05d}_{j_id:05d}.npy", flow)
+     np.save(out_dir / f"covis_{i_id:05d}_{j_id:05d}.npy", cov)
+@@ -154,4 +156,13 @@ def main(args):
+         flow = res.flow.flow_output[0].cpu().numpy()# .astype(np.float32)
+         cov  = res.covisibility.mask[0].cpu().numpy()# .astype(np.uint8)
+-
+-        save_pair(out_dir, src_path, tgt_path, flow, cov, src_rgb, tgt_rgb)
++
++        save_pair(
++            out_dir,
++            src_path,
++            tgt_path,
++            flow,
++            cov,
++            src_rgb,
++            tgt_rgb,
++            save_visualization=args.save_vis,
++        )
+@@ -169,2 +180,4 @@ if __name__ == "__main__":
+     parser.add_argument("--model", choices=["base", "refine"], default="refine")
++    parser.add_argument("--save-vis", action="store_true",
++                        help="Save per-pair diagnostic figures (disabled by default)")
+     main(parser.parse_args())

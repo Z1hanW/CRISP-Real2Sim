@@ -2334,6 +2334,13 @@ def main(
             return str(path)
 
         try:
+          frame_point_counts_nksr = np.asarray(
+              [np.asarray(frame_points).reshape(-1, 3).shape[0] for frame_points in points_bg_map_nksr],
+              dtype=np.int64,
+          )
+          frame_offsets_nksr = np.concatenate(
+              [np.zeros(1, dtype=np.int64), np.cumsum(frame_point_counts_nksr, dtype=np.int64)]
+          )
           normals_np_nksr = np.concatenate(points_normal_nksr, axis=0).astype(np.float32, copy=False)
           points_np_nksr = np.concatenate(points_bg_map_nksr, axis=0).astype(np.float32, copy=False)
           normals_tensor_nksr = torch.from_numpy(normals_np_nksr)
@@ -2356,6 +2363,7 @@ def main(
               points=points_np_nksr,
               normals=normals_np_nksr,
               frame_indices=np.asarray(frame_indices, dtype=np.int32),
+              frame_offsets=frame_offsets_nksr,
               interval=np.int32(interval),
           )
 
@@ -2384,7 +2392,14 @@ def main(
     debug_dir = Path('./')
     REPO_ROOT = Path('./')
     if save_clustering:
-        cluster_dump_dir = (REPO_ROOT / "vis" / tgt_name / hmr_type)
+        default_cluster_root = Path("/data/ubuntu/artifacts/crisp-agentic/clusters")
+        if not default_cluster_root.parent.exists():
+            default_cluster_root = Path(__file__).resolve().parents[2] / "vis"
+        cluster_dump_dir = (
+            Path(os.environ.get("CRISP_AGENTIC_CLUSTER_ROOT", default_cluster_root))
+            / tgt_name
+            / hmr_type
+        )
         cluster_dump_dir.mkdir(parents=True, exist_ok=True)
 
         all_frame_mode = False
