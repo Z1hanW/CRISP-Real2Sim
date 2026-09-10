@@ -5,6 +5,15 @@
 	<a href="https://crisp-real2sim.github.io/CRISP-Real2Sim/"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
 	<a href="https://drive.google.com/drive/folders/1PX8Pqzqjlh5v0Z6xt-NjzTgpugk4igoN?usp=drive_link"><img src="https://img.shields.io/badge/Video_Dataset-blue" alt="Video Dataset"></a>
 </div>
+
+**Zihan Wang, Jiashun Wang, Jeff Tan, Yiwen Zhao, Jessica Hodgins, Shubham Tulsiani, Deva Ramanan. International Conference on Learning Representations (2026).**
+
+## Research overview
+
+CRISP reconstructs human motion and static, rigid scene geometry from monocular RGB video, using planar primitives and human-scene contacts to produce simulation-ready assets.
+
+In [Table 1](https://arxiv.org/html/2512.14696v3#S4.T1), CRISP and VideoMimic assets use the same RL tracking pipeline: overall success is 93.1% versus 44.8%, and RL throughput is 23K versus 16K FPS. FPS includes simulation and policy learning. The paper does not evaluate moving-object or deformable-object reconstruction; curved surfaces and inaccurate motion/contact estimates remain limitations.
+
 	
 ![teaser](https://raw.githubusercontent.com/Z1hanW/CRISP-Real2Sim/main/assets/crisp.png)
 
@@ -208,10 +217,13 @@ If the idea, code, visualization, or video data are helpful for your research,
 please consider citing CRISP.
 
 ```bibtex
-@inproceedings{wangcontact,
-title={Contact-guided Real2Sim from Monocular Video with Planar Scene Primitives},
-author={Wang, Zihan and Wang, Jiashun and Tan, Jeff and Zhao, Yiwen and Hodgins, Jessica K and Tulsiani, Shubham and Ramanan, Deva},
-booktitle={The Fourteenth International Conference on Learning Representations}
+@inproceedings{wang2026contact,
+  title={Contact-guided real2sim from monocular video with planar scene primitives},
+  author={Wang, Zihan and Wang, Jiashun and Tan, Jeff and Zhao, Yiwen and Hodgins, Jessica and Tulsiani, Shubham and Ramanan, Deva},
+  booktitle={International Conference on Learning Representations},
+  volume={2026},
+  pages={115452--115468},
+  year={2026}
 }
 ```
 
